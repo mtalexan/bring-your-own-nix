@@ -1,0 +1,358 @@
+#!/bin/sh
+#
+# BSD 3-Clause License
+#
+# Copyright (c) 2026, Mike (https://github.com/mtalexan/bring-your-own-nix)
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice, this
+#    list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its
+#    contributors may be used to endorse or promote products derived from
+#    this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+#-------------------------------------------------------------------------------
+#
+# This is a wrapper script for making nix calls. It primarily does bootstrapping of
+# nix-portable and then passes thru the arguments.
+# It is intended for deployment with project code that wants to include flake.nix
+# files defining devShell environments and be able to use them on arbitrary host
+# systems. This includes specifying scripts with shebang lines that cause them to
+# be executed in the fully self-bootstrapped devShell environment, but without
+# requirements on the host system or polluting other parallel workspaces.
+#
+# Knowledgeable users of this script can define environment variables to reduce
+# duplication of content across workspaces (nix-portable and/or the nix-portable nix-store),
+# or even to point to a pre-existing working full nix install instead.
+#
+# WARNING: nix-portable does not include protection against simultaneous writes to its nix-store!
+#          This wrapper cannot interpret every possible passthru command to add locking, so
+#          it is left to the caller.
+#
+# Args:
+#
+#  All arguments are passed thru directly to the underlying nix/nix-portable tool.
+#
+# Environment variables:
+#   BYO_NIX=(unset)
+#     If set, it should be the path to a nix binary to use instead of the nix-portable binary.
+#     This should only be used to point to system-installed nix, and will cause the
+#     system nix store to be used as well.
+#     The system nix MUST be configured to support flakes and nix commands so it matches the
+#     argument format of nix-portable.
+#   BYO_NIX_PORTABLE_URL=https://github.com/DavHau/nix-portable/releases/latest/download/nix-portable-$(uname -m)
+#     A custom URL to download the nix-portable binary from. The download only occurs
+#     if nix-portable is needed but not already present, no comparison is performed.
+#     The URL is passed to the BYO_NIX_PORTABLE_DL_CMD command as a quoted argument.
+#   BYO_NIX_PORTABLE_DL_CMD=(unset)
+#     If set, a custom command to run to get nix-portable. The BYO_NIX_PORTABLE_URL is always
+#     passed to this as the first quoted argument, and the absolute path to the BYO_NIX_PORTABLE
+#     (within BYO_NIX_PORTABLE_CACHE_ROOT) is always the second argument. The command is
+#     always run from the current working directory.
+#     The value specified is evaled, so spaces in the value are split on by the shell, and
+#     quotes escaping gets collapsed.
+#     If not set, the default will use the system curl or wget depending on which is available,
+#     and preferred in that order. The default system configuration of them is used, so Root CAs
+#     that are the default are used as well as no authentication, no custom headers, no client
+#     certificates, etc. You should provide your own command (probably as a shell script) if
+#     those are necessary.
+#   BYO_FORCE_DOWNLOAD=(unset)
+#     If set, the BYO_NIX_PORTABLE file is always treated as missing. This can be used to performed
+#     an update of an existing download to a newer URL-specified version for example.
+#   BYO_NIX_PORTABLE_CACHE_ROOT=(script dir)
+#     The BYO_NIX_PORTABLE and BYO_NIX_PORTABLE_STORE paths are assumed to be relative to this location
+#     if not specified as absolute paths.  Can be set to a project or workspace root folder to
+#     easily share the tool and the store among all scripts in the same project for example.
+#     Setting this will NOT affect the directory the nix-portable command is eventually run from,
+#     so paths passed as arguments to it will remain relative to the current directory.
+#     The default is the folder this script is in.
+#   BYO_NIX_PORTABLE=.nix-portable/nix-portable
+#     The location and file name of the nix-portable binary. If the file doesn't yet exist,
+#     it is downloaded with the BYO_NIX_PORTABLE_DL_CMD from the BYO_NIX_PORTABLE_URL to this location.
+#     If the binary is already present it is simply used. The file must be executable already,
+#     otherwise this script will attempt to modify the permissions on it to be executable.
+#     This can be a location shared by multiple tools, or even a singular system location.
+#     A lockfile next to this is always created if it doesn't already exist and is used to lockfile
+#     read/write access to the file so it's atomic across parallel calls.
+#     This path is relative to BYO_NIX_PORTABLE_CACHE_ROOT if not absolute.
+#     This is ignored if BYO_NIX is set, since portable nix does not end up getting used.
+#   BYO_NIX_PORTABLE_STORE=.nix-portable/nix-store
+#     The name and path of the nix-portable store. It is strongly recommended that this be
+#     either a project-unique store, or a location associated with your BYO_NIX_PORTABLE
+#     path.
+#     This should NEVER be your system nix store, since system installed nix expects to be
+#     sole owner of the store and the two tools do not manage locking or store format exactly
+#     the same.
+#     Sharing a store between simultaneous nix-portable calls does not natively do any
+#     protection against simultaneous writes!
+#     It is up to the caller to provide protection against simultaneous writes if needed.
+#     This value is ignored if BYO_NIX is set, since the system nix store is always used then.
+#   BYO_ONLY_GET=(unset)
+#     If set, the script will stop once it ensures nix-portable is available. This can be used to
+#     do only the nix-portable download, and can be used in combination with BYO_FORCE_DOWNLOAD.
+#     This includes making sure the nix-portable is executable if it's already been downloaded.
+#     Ignored if BYO_NIX is set.
+#   BYO_SELF_TEST=(unset)
+#     If set, this script doesn't actually download, create, or call anything, it just performs checks
+#     and prints what it finds to stderr. If BYO_NIX is set, it verifies the specified command is actually
+#     present. If BYO_NIX_PORTABLE is not present it notes that and prints what would be run
+#     to obtain it. If BYO_NIX_PORTABLE is present, it verifies it's executable and checks if
+#     BYO_NIX_PORTABLE_STORE is already present or not.
+
+# the directory this script is in, without any symlink resolution
+SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
+
+if [ -z "$BYO_NIX_PORTABLE_URL" ]; then
+    BYO_NIX_PORTABLE_URL="https://github.com/DavHau/nix-portable/releases/latest/download/nix-portable-$(uname -m)"
+fi
+
+# Wait on the BYO_NIX_PORTABLE_DL_CMD, we only want to check it when a download is actually needed
+
+if [ -z "$BYO_NIX_PORTABLE_CACHE_ROOT" ]; then
+    BYO_NIX_PORTABLE_CACHE_ROOT="$SCRIPT_DIR"
+fi
+
+if [ -z "$BYO_NIX_PORTABLE" ]; then
+    BYO_NIX_PORTABLE=".nix-portable/nix-portable"
+fi
+
+if [ -z "$BYO_NIX_PORTABLE_STORE" ]; then
+    BYO_NIX_PORTABLE_STORE=".nix-portable/nix-store"
+fi
+
+die() {
+    [ $# -eq 0 ] || echo >&2 "ERROR:" "$@"
+    exit 1
+}
+
+# POSIX shell check for an absolute path, looks for leading '/'
+is_abs_path() {
+    dir="$1"
+
+    echo "$dir" | grep -qE '^/' 1>/dev/null 2>&1
+}
+
+# Compliant with BYO_NIX_PORTABLE_DL_CMD format, uses system curl.
+# Requires the write lock to be held.
+# Only prints what would be run if BYO_SELF_TEST is set
+dl_with_curl() {
+    url="$1"
+    abs_dest="$2"
+
+    if [ -n "$BYO_SELF_TEST" ]; then
+        echo "curl -sSLf -o \"${abs_dest}\" \"$url\""
+    else
+        curl -sSLf -o "${abs_dest}" "$url" || return $?
+    fi
+}
+
+# Compliant with BYO_NIX_PORTABLE_DL_CMD format, uses system wget.
+# Requires the write lock to be held.
+# Only prints what would be run if BYO_SELF_TEST is set
+dl_with_wget() {
+    url="$1"
+    abs_dest="$2"
+
+    if [ -n "$BYO_SELF_TEST" ]; then
+        echo "wget --tries 5 -O \"${abs_dest}\" \"$url\""
+    else
+        wget --tries 5 -O "${abs_dest}" "$url" || return $?
+    fi
+}
+
+# Handles calling specified command to download, or picking and calling the correct default.
+# Requires the write lock to be held.
+# Only prints what would be run if BYO_SELF_TEST is set
+get_nix_portable() {
+    abs_dest="$1"
+
+    if [ -z "$BYO_NIX_PORTABLE_DL_CMD" ]; then
+        if command -v curl 1>/dev/null 2>&1; then
+            # handles only printing for BYO_SELF_TEST
+            dl_with_curl "${BYO_NIX_PORTABLE_URL}" "${abs_dest}" || return $?
+        elif command -v wget 1>/dev/null 2>&1; then
+            # handles only printing for BYO_SELF_TEST
+            dl_with_wget "${BYO_NIX_PORTABLE_URL}" "${abs_dest}" || return $?
+        else
+            die "Downloading nix-portable; No curl or wget present, and no BYO_NIX_PORTABLE_DL_CMD defined"
+        fi
+    else
+        # does not handle only printing for BYO_SELF_TEST itself
+        if [ -n "$BYO_SELF_TEST" ]; then
+            echo >&2 "${BYO_NIX_PORTABLE_DL_CMD} \"$url\" \"$abs_dest\""
+        else
+            # eval it so the contents of the variables get treated like a command
+            eval "${BYO_NIX_PORTABLE_DL_CMD} \"$url\" \"$abs_dest\"" || return $?
+        fi
+    fi
+}
+
+# Checks for and then gets nix portable if it's not present.
+# Handles picking the right downloader if necessary, and creating/holding the
+# read/write lock in the process.
+# Args:
+#   1: the absolute destination the file should be cached at. A *.lock will be looked for/created
+#      next to it that's used as the read/write flock.
+#      Path will be created if it doesn't exist.
+# Environment:
+#  BYO_SELF_TEST
+#  BYO_NIX_PORTABLE_DL_CMD
+#  BYO_NIX_PORTABLE_URL
+bootstrap_nix_portable() {
+    abs_dest="$1"
+    abs_dest_lock="${abs_dest}.lock"
+    # a temporary location to download the file to before moving it so it's written atomically
+    abs_dest_tmp="$(mktemp -u)"
+
+    if ! [ -d "$(dirname "$abs_dest")" ]; then
+        if [ -n "$BYO_SELF_TEST" ]; then
+            echo >&2 "nix-portable not found at $abs_dest"
+        else
+            mkdir -p "$(dirname "$abs_dest")" || die "Creating nix-portable cache directory: $(dirname "$abs_dest")"
+        fi
+    fi
+
+    # Create the lockfile, but only if it doesn't already exist and we're not BYO_SELF_TEST.
+    if [ -z "$BYO_SELF_TEST" ] && ! [ -f "${abs_dest_lock}" ]; then
+        touch "${abs_dest_lock}" || die "Creating lockfile for nix-portable: ${abs_dest_lock}"
+    fi
+
+    if ! [ -f "${abs_dest}" ] || [ -n "$BYO_FORCE_DOWNLOAD" ] ; then
+        if [ -n "$BYO_SELF_TEST" ]; then
+            if [ -n "$BYO_FORCE_DOWNLOAD" ]; then
+                echo >&2 "nix-portable not found (forced) at $abs_dest"
+            else
+                echo >&2 "nix-portable not found at $abs_dest"
+            fi
+        fi
+
+        # Download the file to a temporary location first, but do it with the write lock held so
+        # parallel calls while we're downloading don't try to do their own duplicate downloads.
+        _rc=0
+        if [ -z "$BYO_SELF_TEST" ]; then
+            exec 9>>"${abs_dest_lock}"
+            flock -x 9
+        fi
+        {
+            # Someone else might have been getting it while we were waiting on the write lock,
+            # so check again it still doesn't exist now that we have the lock.
+            if ! [ -f "${abs_dest}" ] || [ -n "$BYO_FORCE_DOWNLOAD" ] ; then
+                # make sure we'll cleanup our temp file if we exit for any reason before moving it to the final location
+                trap 'rm -f "${abs_dest_tmp}"' EXIT
+
+                get_nix_portable "$abs_dest_tmp" || die "Downloading nix-portable to temporary location: ${abs_dest_tmp}"
+                if [ -n "$BYO_SELF_TEST" ]; then
+                    echo >&2 "chmod a+x \"${abs_dest_tmp}\""
+                    echo >&2 "mv \"${abs_dest_tmp}\" \"${abs_dest}\""
+                else
+                    chmod a+x "${abs_dest_tmp}" || die "Enabling execute permissions for downloaded nix-portable: ${abs_dest_tmp}"
+                    mv "${abs_dest_tmp}" "${abs_dest}" || die "Moving downloaded nix-portable to final location: ${abs_dest}"
+                fi
+
+                # remove our trap now that we've moved the downloaded file
+                trap - EXIT
+            fi
+        }
+        if [ -z "$BYO_SELF_TEST" ]; then
+            exec 9>&-
+        fi
+        [ "$_rc" -eq 0 ] || return "$_rc"
+    else
+        if [ -n "$BYO_SELF_TEST" ]; then # found, not forced dl, and self-test
+            echo >&2 "nix-portable found at $abs_dest"
+        else
+            not_executable=
+            if [ -z "$BYO_SELF_TEST" ]; then
+                exec 9>>"${abs_dest_lock}"
+                flock -s 9
+            fi
+            {
+                [ -x "$abs_dest" ] || not_executable=1
+            }
+            if [ -z "$BYO_SELF_TEST" ]; then
+                exec 9>&-
+            fi
+
+            if [ -n "$not_executable" ]; then
+                if [ -n "$BYO_SELF_TEST" ]; then
+                    echo >&2 "nix-portable missing execute permission"
+                else
+                    exec 9>>"${abs_dest_lock}"
+                    flock -x 9
+                    {
+                        # if we do this twice because someone else was doing it parallel, no biggie
+                        chmod a+x "${abs_dest}" || die "Enabling execute permissions for nix-portable: ${abs_dest}"
+                    }
+                    exec 9>&-
+                fi
+            fi
+        fi
+    fi
+}
+
+if [ -n "$BYO_NIX" ]; then
+    if ! [ -x "$BYO_NIX" ]; then
+        if [ -n "$BYO_SELF_TEST" ]; then
+            echo >&2 "Nix not found or not executable: $BYO_NIX"
+        else
+            die "Not found/executable BYO_NIX=$BYO_NIX"
+        fi
+    else
+        # Make the call with the BYO_NIX tool, no bootstrapping.
+        # Exec the command so it takes over our process instead of running a subshell
+        exec $BYO_NIX "$@"
+    fi
+else # nix-portable
+    nix_portable_path=
+    if is_abs_path "$BYO_NIX_PORTABLE"; then
+        nix_portable_path="$BYO_NIX_PORTABLE"
+    else
+        nix_portable_path="${BYO_NIX_PORTABLE_CACHE_ROOT}/${BYO_NIX_PORTABLE}"
+    fi
+
+    nix_store_path=
+    if is_abs_path "$BYO_NIX_PORTABLE_STORE"; then
+        nix_store_path="$BYO_NIX_PORTABLE_STORE"
+    else
+        nix_store_path="${BYO_NIX_PORTABLE_CACHE_ROOT}/${BYO_NIX_PORTABLE_STORE}"
+    fi
+
+    bootstrap_nix_portable "$nix_portable_path" || die "Getting nix-portable"
+
+    if [ -n "$BYO_SELF_TEST" ]; then
+        # instead of running the command, we just note whether the store already exists
+        if [ -d "$nix_store_path" ]; then
+            echo >&2 "nix-portable store present at ${nix_store_path}"
+        else
+            echo >&2 "nix-portable store not present at ${nix_store_path}"
+        fi
+    elif [ -z "$BYO_ONLY_GET" ]; then
+        # nix-portable uses the environment variable NP_LOCATION to define where the store should be
+        NP_LOCATION="${nix_store_path}"
+        export NP_LOCATION
+        # 'nix-portable nix' is how you run nix commands.
+        # Exec the command so it takes over our process instead of running a subshell
+        exec "${nix_portable_path}" nix "$@"
+    fi
+fi
+
+# self test should always exit with an error
+[ -z "$BYO_SELF_TEST" ] || exit 1
