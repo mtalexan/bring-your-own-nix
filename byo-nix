@@ -242,6 +242,8 @@ bootstrap_nix_portable() {
             else
                 echo >&2 "nix-portable not found at $abs_dest"
             fi
+        else
+            echo >&2 "Initializing: Downloading nix-portable to $abs_dest"
         fi
 
         # Download the file to a temporary location first, but do it with the write lock held so
@@ -316,9 +318,13 @@ if [ -n "$BYO_NIX" ]; then
             die "Not found/executable BYO_NIX=$BYO_NIX"
         fi
     else
-        # Make the call with the BYO_NIX tool, no bootstrapping.
-        # Exec the command so it takes over our process instead of running a subshell
-        exec $BYO_NIX "$@"
+        if [ -n "$BYO_SELF_TEST" ]; then
+            echo >&2 "Nix found and executable: $BYO_NIX"
+        else
+            # Make the call with the BYO_NIX tool, no bootstrapping.
+            # In our current shell.
+            exec $BYO_NIX "$@"
+        fi
     fi
 else # nix-portable
     nix_portable_path=
@@ -345,11 +351,15 @@ else # nix-portable
             echo >&2 "nix-portable store not present at ${nix_store_path}"
         fi
     elif [ -z "$BYO_ONLY_GET" ]; then
+        # nix-portable requires git, and will install it on the first call if we don't tell it where to find an existing one.
+        # Use the system one if present, otherwise this is blank and nix-portable will install it itself.
+        NP_GIT=$(which git 2>/dev/null)
+        export NP_GIT
         # nix-portable uses the environment variable NP_LOCATION to define where the store should be
         NP_LOCATION="${nix_store_path}"
         export NP_LOCATION
         # 'nix-portable nix' is how you run nix commands.
-        # Exec the command so it takes over our process instead of running a subshell
+        # In our current shell
         exec "${nix_portable_path}" nix "$@"
     fi
 fi
