@@ -155,12 +155,12 @@ is_abs_path() {
 # Only prints what would be run if BYO_SELF_TEST is set
 dl_with_curl() {
     url="$1"
-    abs_dest="$2"
+    abs_dl_dest="$2"
 
     if [ -n "$BYO_SELF_TEST" ]; then
-        echo "curl -sSLf -o \"${abs_dest}\" \"$url\""
+        echo "curl -sSLf -o \"${abs_dl_dest}\" \"$url\""
     else
-        curl -sSLf -o "${abs_dest}" "$url" || return $?
+        curl -sSLf -o "${abs_dl_dest}" "$url" || return $?
     fi
 }
 
@@ -169,12 +169,12 @@ dl_with_curl() {
 # Only prints what would be run if BYO_SELF_TEST is set
 dl_with_wget() {
     url="$1"
-    abs_dest="$2"
+    abs_dl_dest="$2"
 
     if [ -n "$BYO_SELF_TEST" ]; then
-        echo "wget --tries 5 -O \"${abs_dest}\" \"$url\""
+        echo "wget --tries 5 -O \"${abs_dl_dest}\" \"$url\""
     else
-        wget --tries 5 -O "${abs_dest}" "$url" || return $?
+        wget --tries 5 -O "${abs_dl_dest}" "$url" || return $?
     fi
 }
 
@@ -182,12 +182,12 @@ dl_with_wget() {
 # Requires the write lock to be held.
 # Only prints what would be run if BYO_SELF_TEST is set
 get_nix_portable() {
-    abs_dest="$1"
+    abs_dl_dest="$1"
 
     if [ -z "$BYO_NIX_PORTABLE_DL_CMD" ]; then
         if command -v curl 1>/dev/null 2>&1; then
             # handles only printing for BYO_SELF_TEST
-            dl_with_curl "${BYO_NIX_PORTABLE_URL}" "${abs_dest}" || return $?
+            dl_with_curl "${BYO_NIX_PORTABLE_URL}" "${abs_dl_dest}" || return $?
         elif command -v wget 1>/dev/null 2>&1; then
             # handles only printing for BYO_SELF_TEST
             dl_with_wget "${BYO_NIX_PORTABLE_URL}" "${abs_dest}" || return $?
@@ -197,10 +197,10 @@ get_nix_portable() {
     else
         # does not handle only printing for BYO_SELF_TEST itself
         if [ -n "$BYO_SELF_TEST" ]; then
-            echo >&2 "${BYO_NIX_PORTABLE_DL_CMD} \"$url\" \"$abs_dest\""
+            echo >&2 "${BYO_NIX_PORTABLE_DL_CMD} \"$BYO_NIX_PORTABLE_URL\" \"$abs_dl_dest\""
         else
             # eval it so the contents of the variables get treated like a command
-            eval "${BYO_NIX_PORTABLE_DL_CMD} \"$url\" \"$abs_dest\"" || return $?
+            eval "${BYO_NIX_PORTABLE_DL_CMD} \"$BYO_NIX_PORTABLE_URL\" \"$abs_dl_dest\"" || return $?
         fi
     fi
 }
