@@ -1,0 +1,264 @@
+#!/bin/sh
+#
+# BSD 3-Clause License
+#
+# Copyright (c) 2026, Mike (https://github.com/mtalexan/bring-your-own-nix)
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice, this
+#    list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its
+#    contributors may be used to endorse or promote products derived from
+#    this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+#-------------------------------------------------------------------------------
+#
+# This script is used for entering a devShell of a Nix flake to run an arbitrary and
+# possibly interactive command within it. Nix may be nix-portable and may need to be
+# automatically bootstrapped.
+# 
+# WARNING: devShell requires nscd or nsncd running on the host!
+#          glibc automatically delegates to it when present, which is required if any
+#          nsswitch.conf is ever used, or if almost any host tools need to be run.
+# WARNING: Because nix-portable doesn't manage store writes between parallel
+#          calls, we need to do detection and flocking of the store for devShells that
+#          require additions or updates to the store.
+# 
+# Args:
+#   1: Path to folder containing a flake.nix
+#   2: Name of the devShell in the flake.nix to enter. If blank, the default is used. 
+#      This will always be a 'devShells.{system-type}.{name}' in the flake.nix, where system-type is auto-detected.
+#      The deprecated 'devShell' or 'devShell.{system-type}' in the flake.nix for the default is not supported.
+#   3*: Commands to run within the devShell. e.g. 'ruby' '$0' '$@'. Must be at least one.
+# 
+# Environment:# 
+#   BYO_NIX_WRAPPER=(script dir)/byo-nix
+#     The location of the byo-nix script to use. Default is the same folder as this script is in.
+# 
+#   These are from byo-nix, but have special effects here as well.
+#   BYO_NIX=(unset)
+#     If set, it should be the path to a nix binary to use instead of the nix-portable binary.
+#     Expected to be a system-installed nix, which handles store locking on its own, so
+#     external flocking is not done when this is set.
+#   BYO_NIX_PORTABLE_CACHE_ROOT=(script dir)
+#     The BYO_NIX_PORTABLE_STORE path is relative to the location specified here.
+#     The default is the folder this script is in.
+#   BYO_NIX_PORTABLE_STORE=.nix-portable/nix-store
+#     The name and path of the nix-portable store. A *.lock file is created next to this store to manage
+#     write access to the store (reads are atomic in nix stores and don't conflict with writes).
+#     Relative paths are relative to BYO_NIX_PORTABLE_CACHE_ROOT.
+# 
+# 
+# Examples:
+#   Each of these requires a properly configured flake.nix that defines the environment(s).
+# 
+#   As a shebang of a python script (assuming the flake.nix has python3), using the default devShell:
+#     #!/usr/bin/env -S sh -c '"$(dirname "$0")"/tools/nix-trampoline" "$(dirname "$0")/flake_dir" "" python3 "$0" "$@"'
+# 
+#   As a shebang of a ruby script using a custom devShell:
+#     #!/usr/bin/env -S sh -c '"$(dirname "$0")"/tools/nix-trampoline" "$(dirname "$0")/flake_dir" "myRubyShell" ruby "$0" "$@"'
+# 
+#   As a standalone call, using the flake from the current directory to run a podman command:
+#     ./tools/nix-trampoline . "isolatedPodmanShell" podman "${podman_args[@]}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# The glibc hardcoded location, this cannot be changed.
+NSCD_SOCKET="/var/run/nscd/socket"
+
+die() {
+    [ $# -eq 0 ] || echo >&2 "ERROR:" "$@"
+    exit 1
+}
+
+# POSIX shell check for an absolute path, looks for leading '/'
+is_abs_path() {
+    dir="$1"
+
+    echo "$dir" | grep -qE '^/' 1>/dev/null 2>&1
+}
+
+# Detect system - matches nix's naming convention
+detect_system() {
+    arch="$(uname -m)"
+    case "$arch" in
+        # TODO: Add more supported types here
+        x86_64)  echo "x86_64-linux" ;;
+        aarch64) echo "aarch64-linux" ;;
+        armv7l)  echo "armv7l-linux" ;;
+        i686)    echo "i686-linux" ;;
+        *)       die "Unrecognized host system type, mapping to Nix system type not known" ;;
+    esac
+}
+
+#-------------------------------
+# Environment
+#-------------------------------
+
+if [ -z "$BYO_NIX_WRAPPER" ]; then
+    BYO_NIX_WRAPPER="${SCRIPT_DIR}/byo-nix"
+fi
+[ -f "$BYO_NIX_WRAPPER" ] || die "Missing byo-nix tool: $BYO_NIX_WRAPPER"
+[ -x "$BYO_NIX_WRAPPER" ] || die "Non-executable byo-nix tool: $BYO_NIX_WRAPPER"
+
+# needs to match the byo-nix default
+if [ -z "$BYO_NIX_PORTABLE_CACHE_ROOT" ]; then
+    BYO_NIX_PORTABLE_CACHE_ROOT="$SCRIPT_DIR"
+fi
+# needs to match the byo-nix default
+if [ -z "$BYO_NIX_PORTABLE_STORE" ]; then
+    BYO_NIX_PORTABLE_STORE=".nix-portable/nix-store"
+fi
+
+_nix_store_path=
+if is_abs_path "$BYO_NIX_PORTABLE_STORE"; then
+    _nix_store_path="$BYO_NIX_PORTABLE_STORE"
+else
+    _nix_store_path="${BYO_NIX_PORTABLE_CACHE_ROOT}/${BYO_NIX_PORTABLE_STORE}"
+fi
+# strip any trailing '/'
+_nix_store_path=$(echo "${_nix_store_path}" | sed -E -e 's@/+$@@g')
+
+_nix_store_lockfile="${_nix_store_path}.lock"
+
+# Need to detect the hardware system type and map it to the nix type.
+_nix_system="$(detect_system)"
+
+#-------------------------------
+# Args
+#-------------------------------
+
+# There must be at least 1 command, otherwise we aren't running anything in the devShell
+[ $# -ge 3 ] || die "Too few arguments. USAGE: $0 <flake_dir> <devShell_name> <commands...>"
+
+_flake_dir="$1"
+_devshell_name="$2"
+shift 2
+# commands are all in $@ now
+
+[ -d "$_flake_dir" ] || die "Flake directory doesn't exist: ${_flake_dir}"
+[ -f "${_flake_dir}/flake.nix" ] || die "No 'flake.nix' in flake directory: ${_flake_dir}"
+# convert to absolue path w/o symlink resolution
+_flake_dir=$(cd "$_flake_dir" && pwd)
+
+# Get the object within the flake.nix for the specific devShell. Only support the modern 
+# 'devShells.*.default' and not the deprecated 'devShell' for the default.
+# Also construct the flake name we need to pass to the 'nix develop' commands.
+if [ -z "$_devshell_name" ]; then
+    _devshell_nix_obj="devShells.${_nix_system}.default"
+    _nix_develop_arg="${_flake_dir}"
+else
+    _devshell_nix_obj="devShells.${_nix_system}.${_devshell_name}"
+    _nix_develop_arg="${_flake_dir}#${_devshell_name}"
+fi
+
+#-------------------------------
+# Check for nscd/nsncd socket
+#-------------------------------
+
+# It's not possible to use devShells without an nscd socket, but some distros, like Fedora,
+# no longer include it.
+# The nscd socket is a hardcoded path in glibc that will be checked instead first before
+# trying to query the nsswitch module libraries. When found, the queries are forwarded to the
+# nscd socket instead, and the nsswitch module libraries run the action instead.
+# Since all direct module libraries loading must exactly match the glibc version and
+# somewhat closely match the build toolchain, it's effectively impossible for glibc
+# in a devShell to use the nsswitch module libraries from the host system, which then prevents
+# most involved system tools from working (i.e. UID querying from user name is impossible).
+if [ ! -S "$NSCD_SOCKET" ]; then
+    cat >&2 <<EOF
+ERROR: nscd or nsncd are required on the host but not present.
+
+The daemon must be available or isolated subshells are unable to use any nsswitch modules,
+which includes all ability to look up user names among other things.
+
+Most distros still include the complete 'nscd' daemon that creates and listens on the ${NSCD_SOCKET},
+but some distros have chosen to remove it without a replacement (e.g. Fedora). For those broken,
+a stand-alone Rust-based 'nsncd' tool is available from various sources that an fulfill just this
+minimum system requirement without any of the additional things full 'nscd' provides that are not
+needed.
+
+Example installations:
+  Ubuntu/Debian (should be present by default):
+    sudo apt install nscd
+    sudo systemctl enable --now nscd
+    
+  Fedora/RHEL (only available from a COPR repo):
+    sudo dnf copr enable kanata/nsncd
+    sudo dnf install nsncd
+    sudo systemctl enable --now nsncd 
+
+  Arch (only available from AUR):
+    # install from AUR (varies by tools)
+    sudo systemctl enable --now nsncd 
+
+EOF
+    exit 1  
+fi
+
+#-------------------------------
+# Check and pre-build devShell
+#-------------------------------
+
+# if we're using nix-portable, any writes to the nix store require a write lock so avoid
+# multiple processes trying to update it at the same time.
+
+# If we're not using nix-portable (i.e. BYO_NIX is set), then we don't need to worry about
+# write locks on the store and we can just let the devShell invocation do the creation
+# automatically.
+if [ -z "$BYO_NIX" ]; then
+    
+    # This will create the store write-lock if it doesn't already exist!
+    _dry_run_output=$("$BYO_NIX_WRAPPER" build --dry-run "${_nix_develop_arg}" 2>&1)
+    [ -n "$_dry_run_output" ] || die "Getting store status for flake devShell from: "$BYO_NIX_WRAPPER" build --dry-run  '${_nix_develop_arg}'"
+    
+    _devshell_store_update=
+    # don't really have a better way to query the status, there is no machine readable way
+    if echo "${_dry_run_output}" | grep -qE '(will be built|will be fetched)'; then
+        _devshell_store_update=1
+    fi
+    
+    if [ -n "$_devshell_store_update" ]; then
+        # the --dry-run ensured the write lock already exists at a minimum, but double check just to be sure
+        [ -f "$_nix_store_lockfile" ] || die "During call to byo-nix, no nix-portable store write lock was created: ${BYO_NIX_WRAPPER}"
+        
+        # get/wait on the write lock
+        exec 9>>"$_nix_store_lockfile"
+        flock -x 9
+        
+        # If we had to wait for the lock, someone may have built this same devShell.
+        # However that will just cause the next command to complete really quickly, and won't be a problem.
+        
+        echo >&2 "Pre-building devShell for: ${_nix_develop_arg}"
+        # use --no-link because we're just building it into the store
+        "$BYO_NIX_WRAPPER" build --no-link "${_nix_develop_arg}" 1>&2 || die "Pre-building the devShell with: $BYO_NIX_WRAPPER build --no-link '${_nix_develop_arg}'"
+        
+        # Release the write lock
+        exec 9>&-
+    fi
+fi
+
+#-------------------------------
+# Enter the devShell
+#-------------------------------
+
+# Replace our current process with the invocation of the devShell
+exec "$BYO_NIX_WRAPPER" develop "${_nix_develop_arg}" --command "$0" "$@"
