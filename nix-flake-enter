@@ -37,10 +37,10 @@
 # 
 # WARNING: devShell requires nscd or nsncd running on the host!
 #          glibc automatically delegates to it when present, which is required if any
-#          nsswitch.conf is ever used, or if almost any host tools need to be run.
+#          nsswitch modules are ever used on the host.
 # WARNING: Because nix-portable doesn't manage store writes between parallel
-#          calls, we need to do detection and flocking of the store for devShells that
-#          require additions or updates to the store.
+#          calls, we need to do detection and write locking of the store for devShells that
+#          require additions or updates.
 # 
 # Args:
 #   1: Path to folder containing a flake.nix
@@ -79,7 +79,7 @@
 #   As a standalone call, using the flake from the current directory to run a podman command:
 #     ./tools/nix-trampoline . "isolatedPodmanShell" podman "${podman_args[@]}"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
 
 # The glibc hardcoded location, this cannot be changed.
 NSCD_SOCKET="/var/run/nscd/socket"
@@ -151,8 +151,9 @@ _nix_system="$(detect_system)"
 
 _flake_dir="$1"
 _devshell_name="$2"
-shift 2
-# commands are all in $@ now
+_command="$3"
+shift 3
+# command args are all in $@ now
 
 [ -d "$_flake_dir" ] || die "Flake directory doesn't exist: ${_flake_dir}"
 [ -f "${_flake_dir}/flake.nix" ] || die "No 'flake.nix' in flake directory: ${_flake_dir}"
@@ -163,10 +164,14 @@ _flake_dir=$(cd "$_flake_dir" && pwd)
 # 'devShells.*.default' and not the deprecated 'devShell' for the default.
 # Also construct the flake name we need to pass to the 'nix develop' commands.
 if [ -z "$_devshell_name" ]; then
-    _devshell_nix_obj="devShells.${_nix_system}.default"
+    # used in nix build calls
+    _nix_devshell_attr="${_flake_dir}#devShells.${_nix_system}.default"
+    # used in nix develop calls
     _nix_develop_arg="${_flake_dir}"
 else
-    _devshell_nix_obj="devShells.${_nix_system}.${_devshell_name}"
+    # used in nix build calls
+    _nix_devshell_attr="${_flake_dir}#devShells.${_nix_system}.${_devshell_name}"
+    # used in nix develop calls
     _nix_develop_arg="${_flake_dir}#${_devshell_name}"
 fi
 
@@ -227,8 +232,8 @@ fi
 if [ -z "$BYO_NIX" ]; then
     
     # This will create the store write-lock if it doesn't already exist!
-    _dry_run_output=$("$BYO_NIX_WRAPPER" build --dry-run "${_nix_develop_arg}" 2>&1)
-    [ -n "$_dry_run_output" ] || die "Getting store status for flake devShell from: "$BYO_NIX_WRAPPER" build --dry-run  '${_nix_develop_arg}'"
+    _dry_run_output=$("$BYO_NIX_WRAPPER" build --dry-run "${_nix_devshell_attr}" 2>&1)
+    [ -n "$_dry_run_output" ] || die "Getting store status for flake devShell from: "$BYO_NIX_WRAPPER" build --dry-run  '${_nix_devshell_attr}'"
     
     _devshell_store_update=
     # don't really have a better way to query the status, there is no machine readable way
@@ -247,9 +252,9 @@ if [ -z "$BYO_NIX" ]; then
         # If we had to wait for the lock, someone may have built this same devShell.
         # However that will just cause the next command to complete really quickly, and won't be a problem.
         
-        echo >&2 "Pre-building devShell for: ${_nix_develop_arg}"
+        echo >&2 "Pre-building devShell for: ${_nix_devshell_attr}"
         # use --no-link because we're just building it into the store
-        "$BYO_NIX_WRAPPER" build --no-link "${_nix_develop_arg}" 1>&2 || die "Pre-building the devShell with: $BYO_NIX_WRAPPER build --no-link '${_nix_develop_arg}'"
+        "$BYO_NIX_WRAPPER" build --no-link "${_nix_devshell_attr}" 1>&2 || die "Pre-building the devShell with: $BYO_NIX_WRAPPER build --no-link '${_nix_devshell_attr}'"
         
         # Release the write lock
         exec 9>&-
@@ -260,5 +265,6 @@ fi
 # Enter the devShell
 #-------------------------------
 
-# Replace our current process with the invocation of the devShell
-exec "$BYO_NIX_WRAPPER" develop "${_nix_develop_arg}" --command "$0" "$@"
+# Replace our current process with the invocation of the devShell.
+# We shifted all our args so $@ is the args to the command (if any) now
+exec "$BYO_NIX_WRAPPER" develop "${_nix_develop_arg}" --command "$_command" "$@"

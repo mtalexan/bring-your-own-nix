@@ -1,0 +1,364 @@
+#!/bin/sh
+#
+# BSD 3-Clause License
+#
+# Copyright (c) 2026, Mike (https://github.com/mtalexan/bring-your-own-nix)
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice, this
+#    list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its
+#    contributors may be used to endorse or promote products derived from
+#    this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+#-------------------------------------------------------------------------------
+#
+# This script is for use in a shebang that wants to run the script contianing it
+# using an interpeter that's part of a nix flake devShell.
+# Supports calling other specilized shebang scripts from a shebang script as well.
+# 
+# WARNING: devShell requires nscd or nsncd running on the host!
+#          glibc automatically delegates to it when present, which is required if any
+#          nsswitch.conf is ever used, or if almost any host tools need to be run.
+#
+# Args:
+#   1: Path to folder containing a flake.nix. This will be converted to an absolute path
+#      without any symlink resolution if not already an absolute path.
+#      WARNING: flake matching is text based on this absolute path, so referencing the same
+#               flake via a different symlink is treated as a different flake.
+#   2: Name of the devShell in the flake.nix to enter. If blank, the default is used. 
+#      This will always be a 'devShells.{system-type}.{name}' in the flake.nix, where system-type is auto-detected.
+#      The deprecated 'devShell'/'devShell.{system-type}' in the flake.nix for the default is not supported.
+#   3: Interpreter to use for the file
+#   4: Always "$0" from the shebang call
+#   5*: Always "$@" from the shebang call
+# 
+# Environment:
+#   See the environment variables for nix-flake-enter and byo-nix, which will be passed thru as well.
+# 
+#   NIX_SHEBANG_DEVSHELL_MERGE=(unset)
+#     A comma-separated list of absolute paths, where multiple paths may be listed together with a
+#     pipe separator. Blank values in the comma-separtaed list are ignored, which allows unconditionally
+#     extending a previously undefined value with a comma (e.g. NIX_SHEBANG_DEVSHELL_MERGE+=",$(pwd)/my_flake_dir" 
+#     is always valid), while pipe separated values cannot be blank (e.g. NIX_SHEBANG_DEVSHELL_MERGE+="$(pwd)/my_flake_dir|"
+#     usually isn't valid). Pipe separators are used for conjoined flake dirs, while commas separate
+#     independent flake dir sets.
+#     Each comma-separated entry indicates a flake(s) in which all devShells are independent from one another.
+#     Pipe-separated paths are for devShells from multiple distinct flake dirs that collectively meet this
+#     requirement. See DevShell Nesting.
+#     All paths must be absolute, and must exist or an error will occur. 
+# 
+#   NIX_FLAKE_ENTER_WRAPPER=(script dir)/nix-flake-enter
+#     The path to the script that wraps the byo-nix calls for entering a devShell.
+#     There's no guarantee this will actually be called since we may determine no additional devShell entry
+#     is necessary.
+# 
+#   __NIX_SHEBANG_STACK
+#     Reserved for internal use.
+# 
+# DevShell Nesting:
+#   Calling a script using this script as a shebang from another script using this script as a
+#   shebang is a likely scenario. When this happens, the devShell used for each shebang may or
+#   may not be the same, and may or may not be from the the same flake. 
+#   devShells, regardless of flake, are always overlaid on top of the current environment, even when
+#   the current environemnt is another devShell. This allows an obvious optimization for when we
+#   don't need to enter a new devShell subshell, when the current environment already matches the
+#   one we want.
+#   There are two ways the current environment can meet what we request, either the most recent devShell
+#   is the same one now being requested, or someone has guaranteed that any intervening devShells that
+#   may have been overlaid on top of the previously applied one being requested do not affect the same
+#   things.
+#   The first case is trivial, if the devShell requested is already the exact one we're in, we don't
+#   need to do anything extra.
+#   The second case however requires someone with knowledge of the specific flakes to inform us about
+#   which can and can't affect each other. The NIX_SHEBANG_DEVSHELL_MERGE environment variable is how
+#   a caller, who usually also controls the flake(s) being entered, informs us that all the devShells
+#   are independent and can therefore be overlaid in any order without affecting one another.  
+#   This might extend to all devShells across a predefined set of flakes as well, not just devShells within
+#   single flakes.
+# 
+#   The NIX_SHEBANG_DEVSHELL_MERGE variable has a 2-part hierarchy for specifying which flakes include only
+#   independent devShells. The comma-separated list is used to separate each set of flakes where all devShells
+#   within the set are independent from one another. Flake directories within each set are pipe-separated.
+# 
+#   For example, when 'NIX_SHEBANG_DEVSHELL_MERGE=', this script will check if the devShell and flake
+#   dir requested are one we're currently in that has no other devShell on top of it. If so, it doesn't need
+#   to enter the devShell again because the top-most devShell already matches what's requested.
+#   If 'NIX_SHEBANG_DEVSHELL_MERGE=$(pwd)/flake_dir_a', this script will check if the flake dir requested
+#   is '$(pwd)/flake_dir_a'. If so, it will look thru the stack of devShells that it is currently nested
+#   within until it finds a devShell from a flake dir that is not '$(pwd)/flake_dir_a', looking for a devShell
+#   matching the requested devShell. If it finds one, it doesn't need to re-enter the devShell since it's already
+#   within the devShell and it's been told that the other additional devShells do not affect the one that was
+#   requested.
+#   If 'NIX_SHEBANG_DEVSHELL_MERGE=$(pwd)/flake_dir_a,$(pwd)/flake_dir_b', this script will check if
+#   the requested flake dir matches '$(pwd)/flake_dir_a' or '$(pwd)/flake_dir_b'. If it does, it will look thru
+#   the stack of nested devShells until it finds one that does not match the requested flake dir, looking
+#   for a devShell matching the one requested. If the request was for `$(pwd)/flake_dir_b', the stack search
+#   stops when it encounters any devShell that isn't for '$(pwd)/flake_dir_b', including '$(pwd)/flake_dir_a'.
+#   If a devShell match is found however, the devShell doesn't need to be re-entered because it has only had
+#   devShells that were specified to be non-conflicting overlaid on top of it.
+#   If 'NIX_SHEBANG_DEVSHELL_MERGE=$(pwd)/flake_dir_a|$(pwd)/flake_dir_b,$(pwd)/flake_dir_c', this script
+#   will check ifthe requested flake dir matches '$(pwd)/flake_dir_a', '$(pwd)/flake_dir_b', or '$(pwd)/flake_dir_c'. 
+#   If it matches '$(pwd)/flake_dir_a' or `$(pwd)/flake_dir_b', it will look thru the stack of nested devShells
+#   until it reaches one that is neither '$(pwd)/flake_dir_a' nor '$(pwd)/flake_dir_b', looking for a devShell
+#   that matches both the specific flake dir and devShell requested. If a devShell match is found, the devShell
+#   doesn't need to be re-entered because it has only had devShells that were specified to be non-conflicting
+#   overlaid on top of it. Notably, a requst for devShell X from flake_dir_a still will not match a devShell X
+#   from flake_dir_b, but all devShells from both flake_dir_a and flake_dir_b are considered entirely independent
+#   from one another and allowed to be applied in any order.
+#   
+# 
+# Examples:
+#   Each of these requires a properly configured flake.nix that defines the environment(s).
+# 
+#   As a shebang of a python script (assuming the flake.nix has python3), using the default devShell:
+#     #!/usr/bin/env -S sh -c '"$(dirname "$0")"/tools/nix-trampoline" "$(dirname "$0")/flake_dir" "" python3 "$0" "$@"'
+# 
+#   As a shebang of a ruby script using a custom devShell:
+#     #!/usr/bin/env -S sh -c '"$(dirname "$0")"/tools/nix-trampoline" "$(dirname "$0")/flake_dir" "myRubyShell" ruby "$0" "$@"'
+# 
+#   As a standalone call, using the flake from the current directory to run a podman command:
+#     ./tools/nix-trampoline . "isolatedPodmanShell" podman "${podman_args[@]}"
+# 
+#   As a shebang for a shell script where all devShells in the flake from the current directory are independent from one another
+#   so they may be overlaid in any order without conflict.
+#     #!/usr/bin/env -S sh -c 'NIX_SHEBANG_DEVSHELL_MERGE+=",$(pwd)" "$(dirname "$0")"/tools/nix-trampoline" "$(dirname "$0")/flake_dir" "" "bash" "$0" "$@"''
+# 
+#   As a shebang for a shell script where all devShells in the ./flake_a and ./flake_b directory are independent from one another
+#   so they may be overlaid in any order without conflict.
+#     #!/usr/bin/env -S sh -c 'NIX_SHEBANG_DEVSHELL_MERGE+=",$(pwd)/flake_a|$(pwd)/flake_b" "$(dirname "$0")"/tools/nix-trampoline" "$(dirname "$0")/flake_dir" "" "bash" "$0" "$@"''
+
+
+SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
+
+die() {
+    [ $# -eq 0 ] || echo >&2 "ERROR:" "$@"
+    exit 1
+}
+
+# POSIX shell check for an absolute path, looks for leading '/'
+is_abs_path() {
+    dir="$1"
+
+    echo "$dir" | grep -qE '^/' 1>/dev/null 2>&1
+}
+
+#-------------------------------
+# Environment
+#-------------------------------
+
+if [ -z "$NIX_FLAKE_ENTER_WRAPPER" ]; then
+    NIX_FLAKE_ENTER_WRAPPER="${SCRIPT_DIR}/nix-flake-enter"
+fi
+
+[ -f "$NIX_FLAKE_ENTER_WRAPPER" ] || die "No such nix-flake-enter: ${NIX_FLAKE_ENTER_WRAPPER}"
+[ -x "$NIX_FLAKE_ENTER_WRAPPER" ] || die "Not executable nix-flake-enter: ${NIX_FLAKE_ENTER_WRAPPER}"
+
+#-------------------------------
+# Args
+#-------------------------------
+
+# There must be at least an interpreter and a script path, otherwise we aren't using the shebang
+[ $# -ge 4 ] || die "Too few arguments. USAGE: $0 <flake_dir> <devShell_name> <interpreter> <script_path> [<script_args>...]"
+
+_flake_dir_arg="$1"
+_devshell_arg="$2"
+shift 2
+# The rest are the interpreter, the script path, and any script arguments.
+
+[ -d "$_flake_dir_arg" ] || die "Flake directory doesn't exist: ${_flake_dir_arg}"
+[ -f "${_flake_dir_arg}/flake.nix" ] || die "No 'flake.nix' in flake directory: ${_flake_dir_arg}"
+# convert to absolue path w/o symlink resolution
+_flake_dir_arg=$(cd "$_flake_dir_arg" && pwd)
+
+# We only care about a consistent name for our stack. 
+# We can assume the nix "system" type is always the same, so no need to track it too, even though it's technically part of the devShell spec.
+if [ -z "$_devshell_arg" ]; then
+    _nix_flake_devshell="${_flake_dir_arg}#default"
+else
+    _nix_flake_devshell="${_flake_dir_arg}#${_devshell_arg}"
+fi
+
+#-------------------------------
+# Stack Check helpers
+#-------------------------------
+
+get_flake_from_devshell_id() {
+    # splits on the first '#'
+    echo "${1%%#*}"
+}
+
+# Check if a value is in a pipe-separated list
+# Args:
+#  1: Value to look form
+#  2: Pipe-separated list to look in (may be empty)
+is_in_pipe_list() {
+    _value="$1"
+    _list="$2"
+
+    [ -z "$_list" ] && return 1
+
+    # Use start and end of string anchors, or pipe separator char to bound the value match
+    if echo "${_list}" | grep -qE "(^|[|])${_value}([|]|\$)" 1>/dev/null 2>&1; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Extend the pipe-separated list if the value isn't already present in it.
+# Args:
+#  1: Value to add
+#  2: Current list (may be blank)
+# Outputs to stdout the new list
+add_to_pipe_list() {
+    if [ -z "$2" ]; then
+        echo "$1"
+    elif is_in_pipe_list "$1" "$2"; then
+        echo "$2"
+    else
+        echo "${1}|${2}"
+    fi
+}
+
+# Creates a pipe-separated list of flake dirs that are defined as having independent
+# devShells from the provided flake dir.
+# Note that transitive properly does not apply to these sets, so we only need to
+# look for sets that explicitly include the passed folder. But there may be more than
+# one match in the list we're searching.
+# 
+# WARNING: All flake path matching is text-based, absolute paths of flakes are expected.
+#          Referencing a flake via different symlinks will appear to be separate flakes.
+# Args:
+#   1: The flake path to look for matching flake sets for
+# Environment:
+#   NIX_SHEBANG_DEVSHELL_MERGE
+#     The comma-separated list of flake sets, where each flake set is a pipe-separated list
+#     of flake dirs that have only devShells that are independent among all devShells in the
+#     set of flake dirs. A flake set may be empty, but a pipe-separated list cannot contain
+#     an empty folder for one of the pipe-separated paths.
+#   
+build_compatible_flake_set_list() {
+    _flake_dir_to_find="$1"
+    _compatible_flakes_list=""
+
+    if [ -n "$NIX_SHEBANG_DEVSHELL_MERGE" ]; then
+        set -f # turn off globbing so we can safely parse the lists
+        _old_ifs1="$IFS"
+        IFS=','
+        for _flake_set in $NIX_SHEBANG_DEVSHELL_MERGE; do
+            IFS="$_old_ifs1" # reset IFS back to normal for the loop body
+            
+            [ -n "$_flake_set" ] || continue # skip blank comma-separated entries
+
+            _old_ifs2="$IFS"
+            IFS='|'
+            for _flake_dir in $_flake_set; do
+                IFS="$_old_ifs2" # reset IFS back to normal for the loop body
+                
+                [ -n "$_flake_dir" ] || die "Invalid NIX_SHEBANG_DEVSHELL_MERGE: pipe-separated flake set entries cannot be blank: '$_flake_set'"
+
+                if is_in_pipe_list "$_flake_dir_to_find" "$_flake_set"; then
+                    _compatible_flakes_list="$(add_to_pipe_list "$_flake_set" "$_compatible_flakes_list")"
+                fi
+            done
+            IFS="$_old_ifs2"
+            
+        done
+        IFS="$old_ifs1"
+        set +f # turn globbing back on (the default)
+    fi
+
+    echo "$_compatible_flakes_list"
+}
+
+# Are we already in the correct devShell for the given flake+devShell?
+# Args:
+#   1: The flake dir (absolute path) + devShell, sepearated by a '#' that we are requesting
+# Environment:
+#   __NIX_SHEBANG_STACK
+#     A pipe-separated list of flake dir + devShells that we've already entered. Stack top is the start.
+#   NIX_SHEBANG_DEVSHELL_MERGE
+#     The comma-separated list of flake sets, where each flake set is a pipe-separated list of flake dirs
+#     that have only devShells that are independent among all devShells in the set of flake dirs.
+# Return Code:
+#   0: Need to enter the devShell
+#   1: Don't need to enter the devShell
+need_devshell_enter() {
+    _requested_devShell="$1"
+
+    [ -n "$__NIX_SHEBANG_STACK" ] || return 0
+
+    _requested_flake_dir="$(get_flake_from_devshell_id "$_requested_dev")"
+    _compatible_flake_dirs_list="$(build_compatible_flake_set_list "$_requested_flake_dir")"
+
+    set -f # turn off globbing so we can safely parse the list
+    old_ifs="$IFS"
+    IFS='|'
+    for _devShell in ${__NIX_SHEBANG_STACK}; do
+        IFS="$old_ifs" # reset IFS back to normal for the loop body
+
+        if [ "$_devShell" = "$_requested_devShell" ]; then
+            # Found the devShell in the stack, so we don't need to enter it again
+            return 1
+        elif ! is_in_pipe_list "$(get_flake_from_devshell_id "$_devShell")" "$_compatible_flake_dirs_list"; then
+            # flakedir of the devShell in the stack is not in our list of non-conflicting flake dirs, so
+            # we have to enter the devShell.
+            return 0
+        fi
+    done
+    IFS="$old_ifs"
+    set +f # turn globbing back on (the default)
+
+    # no match found, need to enter the devShell
+    return 0
+}
+
+push_stack() {
+    __NIX_SHEBANG_STACK="${1}|${__NIX_SHEBANG_STACK}"
+}
+
+pop_stack() {
+    # remove the top of the stack, which is the first entry in the pipe-separated list
+    __NIX_SHEBANG_STACK="${__NIX_SHEBANG_STACK#*|}"    
+}
+
+#-------------------------------
+# DevShell Stack check
+#-------------------------------
+
+# __NIX_SHEBANG_STACK is a pipe-separated list acting as a stack of devShells we've entered.
+# The top of the stack is the front of the list.
+# We add to the stack when we enter a devShell to execute a command, and pop from the stack
+# if we had to enter a devShell to run the command.
+export __NIX_SHEBANG_STACK    
+
+if need_devshell_enter "$_nix_flake_devshell"; then
+    push_stack "$_nix_flake_devshell"
+
+    # Enter the devShell and run the command in it
+    exec "$NIX_FLAKE_ENTER_WRAPPER" "$_flake_dir_arg" "$_devshell_arg" "$@"
+    
+    pop_stack    
+else
+    # We're already in the correct devShell, just run the interpreter command
+    exec "$@"
+fi
