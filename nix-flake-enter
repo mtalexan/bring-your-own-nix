@@ -47,7 +47,8 @@
 #   2: Name of the devShell in the flake.nix to enter. If blank, the default is used. 
 #      This will always be a 'devShells.{system-type}.{name}' in the flake.nix, where system-type is auto-detected.
 #      The deprecated 'devShell' or 'devShell.{system-type}' in the flake.nix for the default is not supported.
-#   3*: Commands to run within the devShell. e.g. 'ruby' '$0' '$@'. Must be at least one.
+#   3*: (optional) Commands to run within the devShell. e.g. 'ruby' '$0' '$@'.
+#       Uses the nix default of an interactive bash shell if not specified.
 # 
 # Environment:# 
 #   BYO_NIX_WRAPPER=(script dir)/byo-nix
@@ -65,7 +66,12 @@
 #     The name and path of the nix-portable store. A *.lock file is created next to this store to manage
 #     write access to the store (reads are atomic in nix stores and don't conflict with writes).
 #     Relative paths are relative to BYO_NIX_PORTABLE_CACHE_ROOT.
-# 
+#   BYO_NO_LOCK=(unset)
+#     If set, no locking of the store will occur, nor will any pre-check of the devShell to see if it
+#     needs to be built. This option should only be used when a previously created nix-portable and
+#     store are being transferred with the associated flake.lock and supplied from a read-only location
+#     that doesn't allow locking. Or (not recommended even still) if you can absolutely guarantee that
+#     only a single process on the system will ever possibly be trying to modify the store.
 # 
 # Examples:
 #   Each of these requires a properly configured flake.nix that defines the environment(s).
@@ -151,8 +157,7 @@ _nix_system="$(detect_system)"
 
 _flake_dir="$1"
 _devshell_name="$2"
-_command="$3"
-shift 3
+shift 2
 # command args are all in $@ now
 
 [ -d "$_flake_dir" ] || die "Flake directory doesn't exist: ${_flake_dir}"
@@ -226,14 +231,14 @@ fi
 # if we're using nix-portable, any writes to the nix store require a write lock so avoid
 # multiple processes trying to update it at the same time.
 
-# If we're not using nix-portable (i.e. BYO_NIX is set), then we don't need to worry about
-# write locks on the store and we can just let the devShell invocation do the creation
-# automatically.
-if [ -z "$BYO_NIX" ]; then
+# If we're not using nix-portable (i.e. BYO_NIX is set), or locking is explicitly disabled,
+# then we don't need to worry about write locks on the store and we can just let the devShell
+# invocation do any store modifications automatically.
+if [ -z "$BYO_NIX" ] || [ -n "$BYO_NO_LOCK" ]; then
     
     # This will create the store write-lock if it doesn't already exist!
     _dry_run_output=$("$BYO_NIX_WRAPPER" build --dry-run "${_nix_devshell_attr}" 2>&1)
-    [ -n "$_dry_run_output" ] || die "Getting store status for flake devShell from: "$BYO_NIX_WRAPPER" build --dry-run  '${_nix_devshell_attr}'"
+    [ -n "$_dry_run_output" ] || die "Getting store status for flake devShell from: '$BYO_NIX_WRAPPER' build --dry-run  '${_nix_devshell_attr}'"
     
     _devshell_store_update=
     # don't really have a better way to query the status, there is no machine readable way
@@ -265,6 +270,15 @@ fi
 # Enter the devShell
 #-------------------------------
 
-# Replace our current process with the invocation of the devShell.
-# We shifted all our args so $@ is the args to the command (if any) now
-exec "$BYO_NIX_WRAPPER" develop "${_nix_develop_arg}" --command "$_command" "$@"
+# we previously shifted the args so only the command and args are in $@
+if [ $# -ge 1 ]; then
+    _command="$1"
+    shift
+    # Replace our current process with the invocation of the devShell.
+    # We shifted all our args so $@ is the args (if any) to the command now
+    exec "$BYO_NIX_WRAPPER" develop "${_nix_develop_arg}" --command "$_command" "$@"
+else
+    # Replace our current process with the invocation of the devShell.
+    # Defaults to an interactive bash shell in the devShell
+    exec "$BYO_NIX_WRAPPER" develop "${_nix_develop_arg}"
+fi

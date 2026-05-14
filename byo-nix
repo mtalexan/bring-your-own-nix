@@ -106,6 +106,13 @@
 #     protection against simultaneous writes!
 #     It is up to the caller to provide protection against simultaneous writes if needed.
 #     This value is ignored if BYO_NIX is set, since the system nix store is always used then.
+#   BYO_NO_LOCK=(unset)
+#     If set, no locking will be performed when downloading/checking the nix-portable and none
+#     will be created for the store. 
+#     This should ONLY be used when an existing store and nix-portable matching a flake.lock
+#     are all being deployed together via a read-only file system location, or if it can be absolutely
+#     guaranteed that only a single process on the system will be using the store and/or downloading
+#     nix-portable.
 #   BYO_ONLY_GET=(unset)
 #     If set, the script will stop once it ensures nix-portable is available. This can be used to
 #     do only the nix-portable download, and can be used in combination with BYO_FORCE_DOWNLOAD.
@@ -217,6 +224,7 @@ get_nix_portable() {
 #  BYO_SELF_TEST
 #  BYO_NIX_PORTABLE_DL_CMD
 #  BYO_NIX_PORTABLE_URL
+#  $BYO_NO_LOCK
 bootstrap_nix_portable() {
     _abs_dest="$1"
     _abs_dest_lock="${_abs_dest}.lock"
@@ -232,7 +240,7 @@ bootstrap_nix_portable() {
     fi
 
     # Create the lockfile, but only if it doesn't already exist and we're not BYO_SELF_TEST.
-    if [ -z "$BYO_SELF_TEST" ] && ! [ -f "${_abs_dest_lock}" ]; then
+    if [ -z "$BYO_SELF_TEST" ] && [ -z "$BYO_NO_LOCK" ] && ! [ -f "${_abs_dest_lock}" ]; then
         touch "${_abs_dest_lock}" || die "Creating lockfile for nix-portable: ${_abs_dest_lock}"
     fi
 
@@ -250,7 +258,7 @@ bootstrap_nix_portable() {
         # Download the file to a temporary location first, but do it with the write lock held so
         # parallel calls while we're downloading don't try to do their own duplicate downloads.
         _rc=0
-        if [ -z "$BYO_SELF_TEST" ]; then
+        if [ -z "$BYO_SELF_TEST" ] && [ -z "$BYO_NO_LOCK" ]; then
             exec 9>>"${_abs_dest_lock}"
             flock -x 9
         fi
@@ -259,7 +267,7 @@ bootstrap_nix_portable() {
             # so check again it still doesn't exist now that we have the lock.
             if ! [ -f "${_abs_dest}" ] || [ -n "$BYO_FORCE_DOWNLOAD" ] ; then
                 # make sure we'll cleanup our temp file if we exit for any reason before moving it to the final location
-                trap 'rm -f "${abs_dest_tmp}"' EXIT
+                trap 'rm -f "${_abs_dest_tmp}"' EXIT
 
                 get_nix_portable "$_abs_dest_tmp" || die "Downloading nix-portable to temporary location: ${_abs_dest_tmp}"
                 if [ -n "$BYO_SELF_TEST" ]; then
@@ -274,7 +282,7 @@ bootstrap_nix_portable() {
                 trap - EXIT
             fi
         }
-        if [ -z "$BYO_SELF_TEST" ]; then
+        if [ -z "$BYO_SELF_TEST" ] && [ -z "$BYO_NO_LOCK" ]; then
             exec 9>&-
         fi
         [ "$_rc" -eq 0 ] || return "$_rc"
@@ -283,14 +291,14 @@ bootstrap_nix_portable() {
             echo >&2 "nix-portable found at $_abs_dest"
         else
             _not_executable=
-            if [ -z "$BYO_SELF_TEST" ]; then
+            if [ -z "$BYO_SELF_TEST" ] && [ -z "$BYO_NO_LOCK" ]; then
                 exec 9>>"${_abs_dest_lock}"
                 flock -s 9
             fi
             {
-                [ -x "$_abs_dest" ] || not_executable=1
+                [ -x "$_abs_dest" ] || _not_executable=1
             }
-            if [ -z "$BYO_SELF_TEST" ]; then
+            if [ -z "$BYO_SELF_TEST" ] && [ -z "$BYO_NO_LOCK" ]; then
                 exec 9>&-
             fi
 
@@ -298,13 +306,17 @@ bootstrap_nix_portable() {
                 if [ -n "$BYO_SELF_TEST" ]; then
                     echo >&2 "nix-portable missing execute permission"
                 else
-                    exec 9>>"${_abs_dest_lock}"
-                    flock -x 9
+                    if [ -z "$BYO_NO_LOCK" ]; then
+                        exec 9>>"${_abs_dest_lock}"
+                        flock -x 9
+                    fi
                     {
                         # if we do this twice because someone else was doing it parallel, no biggie
                         chmod a+x "${_abs_dest}" || die "Enabling execute permissions for nix-portable: ${_abs_dest}"
                     }
-                    exec 9>&-
+                    if [ -z "$BYO_NO_LOCK" ]; then
+                        exec 9>&-
+                    fi
                 fi
             fi
         fi
@@ -316,6 +328,7 @@ bootstrap_nix_portable() {
 #   1: Absolute destination of the nix-portable store. The lockfile is always *.lock matching the store.
 # Environment:
 #   BYO_SELF_TEST: When set, only print status to stderr, don't create anything.
+#   BYO_NO_LOCK: Lockfile generation is silently skipped
 bootstrap_nix_portable_store() {
     _abs_store_dest="$1"
     # strip any trailing /
@@ -327,7 +340,7 @@ bootstrap_nix_portable_store() {
     if ! [ -d "${_abs_store_dest}" ]; then
         if [ -n "$BYO_SELF_TEST" ]; then
             echo >&2 "nix-portable store not present at ${_abs_store_dest}"
-        else
+        elif [ -z "$BYO_NO_LOCK" ]; then
             mkdir -p "$(dirname "${_abs_store_dest_lock}")" || die "Creating folder for nix-portable store location: ${_abs_store_dest}"
         fi
     elif [ -n "$BYO_SELF_TEST" ]; then
@@ -341,8 +354,8 @@ bootstrap_nix_portable_store() {
         else
             touch "${_abs_store_dest_lock}" || die "Creating nix-portable store lockfile: ${_abs_store_dest_lock}"
         fi
-    elif [ -n "$BYO_SELF_TEST" ]; then
-        echo >&2 "Lockfile for nix-portable store exists: ${abs_store_dest_lock}"
+    elif [ -n "$BYO_SELF_TEST" ] && [ -z "$BYO_NO_LOCK" ]; then
+        echo >&2 "Lockfile for nix-portable store exists: ${_abs_store_dest_lock}"
     fi
 }
 
@@ -379,11 +392,11 @@ else # nix-portable
         _nix_store_path="${BYO_NIX_PORTABLE_CACHE_ROOT}/${BYO_NIX_PORTABLE_STORE}"
     fi
 
-    bootstrap_nix_portable "$nix_portable_path" || die "Getting nix-portable"
+    bootstrap_nix_portable "$_nix_portable_path" || die "Getting nix-portable"
 
     # download-only doesn't setup the store lockfile
     if [ -z "$BYO_ONLY_GET" ]; then
-        bootstrap_nix_portable_store "${nix_store_path}" || die "Ensuring nix-portable store can be used"
+        bootstrap_nix_portable_store "${_nix_store_path}" || die "Ensuring nix-portable store can be used"
 
         if [ -z "$BYO_SELF_TEST" ]; then
             # nix-portable requires git, and will install it on the first call if we don't tell it where to find an existing one.
@@ -391,11 +404,11 @@ else # nix-portable
             NP_GIT=$(command -v git 2>/dev/null)
             export NP_GIT
             # nix-portable uses the environment variable NP_LOCATION to define where the store should be
-            NP_LOCATION="${nix_store_path}"
+            NP_LOCATION="${_nix_store_path}"
             export NP_LOCATION
             # 'nix-portable nix' is how you run nix commands.
             # Replace our current shell with this command (doesn't return to this script)
-            exec "${nix_portable_path}" nix "$@"
+            exec "${_nix_portable_path}" nix "$@"
         fi
     fi
 fi
