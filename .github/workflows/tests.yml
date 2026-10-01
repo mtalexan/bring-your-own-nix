@@ -36,12 +36,21 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v20
 
-      - name: Install and start nscd
+      - name: Install test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes nscd
+          sudo apt-get install --yes nscd bubblewrap proot
           sudo systemctl start nscd
           test -S /var/run/nscd/socket
+          # Ubuntu 24.04 blocks unprivileged user namespaces, which is how
+          # bubblewrap starts. Hosted runners are disposable, so allow it.
+          if [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = "1" ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          command -v bwrap
+          command -v proot
+          bwrap --bind / / -- /bin/true
+          proot -r / /bin/true
 
       - name: Run tests
         run: ./tests/run-tests.sh

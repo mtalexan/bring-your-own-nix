@@ -1,4 +1,6 @@
 # DevShell entry, real nix-portable, host nix, and nested shebang runs.
+# The nested different-devShell chain runs under bwrap and under proot.
+# run-tests.sh requires those executables unless --skip-bwrap or --skip-proot is passed.
 
 write_dry_wrapper() {
     cat > "$WORK/dry-wrapper.sh" << 'EOF'
@@ -57,6 +59,60 @@ show_tails() {
     _err=$2
     printf '%s stderr:\n' "$_label"
     tail -n 40 "$_err" 2>/dev/null
+}
+
+# One shebang script enters the default devShell and calls another shebang script
+# that enters the cowsay devShell, which calls a third that asks for default again.
+# NP_RUNTIME forces the nix-portable sandbox used for those entries.
+# BYO_TEST_SKIP_BWRAP and BYO_TEST_SKIP_PROOT are set by run-tests.sh.
+# Args:
+#   1: bwrap or proot
+#   2: Absolute path of the store's .nix-portable directory
+run_nested_chain_for_runtime() {
+    _rt_name=$1
+    _rt_dir=$2
+
+    case "$_rt_name" in
+        bwrap)
+            if [ -n "${BYO_TEST_SKIP_BWRAP:-}" ]; then
+                printf 'SKIP bwrap nested different devShell (--skip-bwrap)\n'
+                return 0
+            fi
+            ;;
+        proot)
+            if [ -n "${BYO_TEST_SKIP_PROOT:-}" ]; then
+                printf 'SKIP proot nested different devShell (--skip-proot)\n'
+                return 0
+            fi
+            ;;
+    esac
+
+    printf 'RUN %s nested different devShell\n' "$_rt_name"
+
+    export NP_RUNTIME="$_rt_name"
+    : > "$BYO_TEST_ENTER_LOG"
+    "$ROOT/nested/outer.sh" chain >"$WORK/${_rt_name}-chain.out" 2>"$WORK/${_rt_name}-chain.err"
+    _rt_rc=$?
+    _rt_enters=$(wc -l < "$BYO_TEST_ENTER_LOG" | tr -d ' ')
+    _rt_out=$(cat "$WORK/${_rt_name}-chain.out")
+    _rt_log=$(cat "$BYO_TEST_ENTER_LOG")
+    _rt_used=$(cat "$_rt_dir/conf/last_runtime" 2>/dev/null || true)
+    if [ "$_rt_rc" -eq 0 ] && [ "$_rt_enters" -eq 3 ]; then
+        pass "$_rt_name nested different devShell re-enters"
+    else
+        fail "$_rt_name nested different devShell re-enters" "exit $_rt_rc enters $_rt_enters
+$(show_tails "$_rt_name-chain" "$WORK/${_rt_name}-chain.err")
+$_rt_log"
+    fi
+    assert_contains "$_rt_name chain runs default devShell" "$_rt_out" "Hello, world!"
+    assert_contains "$_rt_name chain runs cowsay devShell" "$_rt_out" "< hello >"
+    assert_contains "$_rt_name chain prints marker" "$_rt_out" "marker"
+    assert_contains "$_rt_name chain enters cowsay devShell" "$_rt_log" " cowsay "
+    if [ "$_rt_used" = "$_rt_name" ]; then
+        pass "$_rt_name runtime selected"
+    else
+        fail "$_rt_name runtime selected" "last_runtime [${_rt_used}]"
+    fi
 }
 
 check_serialized_builds() {
@@ -407,6 +463,18 @@ $(show_tails merge "$WORK/merge.err")
 $(cat "$BYO_TEST_ENTER_LOG")"
     fi
     assert_contains "merge still prints marker" "$merge_out" "marker"
+
+    # run-tests.sh has already required each executable, unless its skip flag was passed.
+    _saved_np_runtime=${NP_RUNTIME-}
+    for _runtime in bwrap proot; do
+        run_nested_chain_for_runtime "$_runtime" "$cache/nix-store/.nix-portable"
+    done
+    if [ -n "$_saved_np_runtime" ]; then
+        NP_RUNTIME=$_saved_np_runtime
+        export NP_RUNTIME
+    else
+        unset NP_RUNTIME
+    fi
 
     printf 'RUN host nix\n'
     reset_env
