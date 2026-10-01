@@ -109,6 +109,14 @@
 #     bundled store paths and building gitMinimal), which this script detects and runs
 #     under the store write lock before the requested command.
 #     This value is ignored if BYO_NIX is set, since the system nix store is always used then.
+#     When this process is already inside the nix-portable sandbox for this store
+#     (/nix/store is that store), the nix binary in the store is executed directly.
+#     Starting nix-portable again would nest proot or bubblewrap. Nested proot cannot
+#     set PTRACE_O_TRACESECCOMP, and then either cannot find the nix binary or fails
+#     later with "Operation not permitted" while reading store paths. A shebang that
+#     enters another devShell from inside one hits this. __BYO_NIX_INSIDE_STORE is
+#     set by this script to the store path when it starts nix-portable, so a later
+#     call can recognize that sandbox without consulting the shebang stack.
 #   BYO_NIX_PORTABLE_STORE_LOCKED=(unset)
 #     Set by a caller that already holds the BYO_NIX_PORTABLE_STORE write lock when it calls
 #     this script. The first-use check then runs without taking that lock again, which would
@@ -395,6 +403,74 @@ nix_portable_store_needs_init() {
     return 1
 }
 
+# Prints the /nix/store path of nix when this process is already inside the
+# nix-portable sandbox for the given store. A system /nix/store is a different
+# directory, so this stays silent there and the caller starts nix-portable as usual.
+# Args:
+#   1: Absolute nix-portable store path, without a trailing slash
+# Output:
+#   /nix/store/<hash>-nix-<version>/bin/nix
+# Returns 1 when this process is not inside that store, or nix cannot be found in it.
+nix_binary_inside_portable_store() {
+    _in_store="$1/.nix-portable/nix/store"
+    [ -d "$_in_store" ] || return 1
+    [ -d /nix/store ] || return 1
+
+    # Same directory as this store, or this byo-nix already entered it.
+    # Proot can report a different device and inode for its /nix bind than for
+    # the host path, so __BYO_NIX_INSIDE_STORE covers that case. The variable
+    # alone is not enough: the nix runtime does not virtualize /nix, and a
+    # system store must not be selected just because the variable is set.
+    _in_same=
+    _in_host=$(stat -c '%d:%i' "$_in_store" 2>/dev/null) || _in_host=
+    _in_guest=$(stat -c '%d:%i' /nix/store 2>/dev/null) || _in_guest=
+    if [ -n "$_in_host" ] && [ "$_in_host" = "$_in_guest" ]; then
+        _in_same=1
+    elif [ "${__BYO_NIX_INSIDE_STORE-}" = "$1" ]; then
+        _in_same=1
+    fi
+    [ -n "$_in_same" ] || return 1
+
+    for _in_candidate in "$_in_store"/*-nix-*/bin/nix; do
+        [ -x "$_in_candidate" ] || continue
+        _in_base=$(basename "$(dirname "$(dirname "$_in_candidate")")")
+        case "$_in_base" in
+            *-nix-[0-9]*) ;;
+            *) continue ;;
+        esac
+        # Reject outputs such as nix-2.20.6-man. The package name ends at the version.
+        _in_ver=${_in_base#*-nix-}
+        case "$_in_ver" in
+            *[!0-9.]*) continue ;;
+        esac
+        _in_guest="/nix/store/${_in_base}/bin/nix"
+        if [ -x "$_in_guest" ]; then
+            printf '%s\n' "$_in_guest"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# nix-portable puts its gitMinimal on PATH. A devShell replaces PATH, so a later
+# nix started inside that devShell needs the same git prepended again.
+# Args:
+#   1: Absolute nix-portable store path, without a trailing slash
+prepend_portable_git() {
+    _git_store="$1/.nix-portable/nix/store"
+    for _git_candidate in "$_git_store"/*-git-minimal-*/bin/git; do
+        [ -e "$_git_candidate" ] || continue
+        _git_base=$(basename "$(dirname "$(dirname "$_git_candidate")")")
+        _git_guest="/nix/store/${_git_base}/bin/git"
+        if [ -x "$_git_guest" ]; then
+            PATH="$(dirname "$_git_guest"):${PATH}"
+            export PATH
+            return 0
+        fi
+    done
+    return 1
+}
+
 # Runs the nix-portable first-use setup for a store while holding the store write lock,
 # so it can't race with another nix-portable process writing to the same store.
 # The store write lock is held while checking, and released before returning.
@@ -484,6 +560,25 @@ else # nix-portable
         # replaces a symlink in the store folder on every call. This makes it unsafe to use
         # for shared stores.
         unset NP_GIT
+        # Already inside this store's sandbox. Do this before first-use setup: that
+        # setup runs nix-portable, which would nest proot or bubblewrap. A shebang
+        # that enters a different devShell from inside one hits this. The store is
+        # already initialized, because this nix came from it.
+        if [ -z "$BYO_SELF_TEST" ]; then
+            _inside_nix=$(nix_binary_inside_portable_store "${_abs_store_dest}") || _inside_nix=
+            if [ -n "$_inside_nix" ]; then
+                _np_conf="${_abs_store_dest}/.nix-portable/conf"
+                if [ -f "${_np_conf}/nix.conf" ]; then
+                    NIX_CONF_DIR="$_np_conf"
+                    export NIX_CONF_DIR
+                fi
+                prepend_portable_git "${_abs_store_dest}" || true
+                unset BYO_NIX_PORTABLE_STORE_LOCKED
+                exec "$_inside_nix" "$@"
+                die "Running nix inside the existing nix-portable store: ${_inside_nix}"
+            fi
+        fi
+
         # This detects if the store has been initialized yet and if not will initialize it. It
         # uses the store write lock for this.
         # If we're called from a script that also needed the write lock, it should have set
@@ -497,6 +592,10 @@ else # nix-portable
             # nix-portable uses the environment variable NP_LOCATION to define where the store should be
             NP_LOCATION="${_nix_store_path}"
             export NP_LOCATION
+            # Visible to later byo-nix calls inside this sandbox. Proot can hide that
+            # /nix and the host store path are the same directory.
+            __BYO_NIX_INSIDE_STORE="${_abs_store_dest}"
+            export __BYO_NIX_INSIDE_STORE
             # 'nix-portable nix' is how you run nix commands.
             # Replace our current shell with this command (doesn't return to this script)
             exec "${_nix_portable_path}" nix "$@"
