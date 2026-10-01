@@ -1,0 +1,40 @@
+name: Tests
+
+on:
+  pull_request:
+    types:
+      - labeled
+      - synchronize
+      - reopened
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    if: >-
+      contains(github.event.pull_request.labels.*.name, 'ready-for-review') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'ready-for-review')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out pull request
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v20
+
+      - name: Install and start nscd
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes nscd
+          sudo systemctl start nscd
+          test -S /var/run/nscd/socket
+
+      - name: Run tests
+        run: ./tests/run-tests.sh
