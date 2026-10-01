@@ -5,7 +5,6 @@ on:
     types:
       - labeled
       - synchronize
-      - reopened
 
 permissions:
   contents: read
@@ -16,9 +15,17 @@ concurrency:
 
 jobs:
   tests:
+    # Run only when ready-for-build is newly added, or when it is already
+    # present and new commits are pushed. Adding any other label must not run.
     if: >-
-      contains(github.event.pull_request.labels.*.name, 'ready-for-review') &&
-      (github.event.action != 'labeled' || github.event.label.name == 'ready-for-review')
+      (
+        github.event.action == 'synchronize' &&
+        contains(github.event.pull_request.labels.*.name, 'ready-for-build')
+      ) ||
+      (
+        github.event.action == 'labeled' &&
+        github.event.label.name == 'ready-for-build'
+      )
     runs-on: ubuntu-24.04
     timeout-minutes: 30
 
