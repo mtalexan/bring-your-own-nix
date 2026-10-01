@@ -1,6 +1,19 @@
 # Bring Your Own Nix
 
-The purpose of this project is to provide tools that can non-persistently bootstrap nix and allow it to be used for a Bring Your Own Tools set of development tools.
+Bootstrap a workspace/project-local nix instance on-demand, including from a script shebang.
+
+## Uses
+
+- Write directly callable scripts that bootstrap their own environment automatically (i.e. what `uv` did for Python, but now for almost any language and/or tools)
+- Use deterministic and reproducible nix flake devShells for a project build environment instead of containerized environments (e.g. dev-containers)
+- Use Nix without installing it (via `nix-portable`, but with an easier-to-use interface)
+
+### Considerations
+
+- You still need `bash` natively installed in your host environment, this is unavoidable
+- You enter an overlay environment, there is no file system isolation, network isolation, etc like with containers
+- You need to define a `flake.nix` that includes a `devShell` with all the tools you need for the overlay environment
+- The first time running a script in a workspace can take longer while it downloads and installs packages (in a workspace store) for your overlay environment
 
 ## Background
 
