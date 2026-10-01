@@ -1,0 +1,8 @@
+# nix-portable binaries and stores created beside the scripts or under tests
+.nix-portable/
+
+# test work directories and nix build outputs
+tests/tmp/
+tests/cache/
+tests/result
+tests/result-*
