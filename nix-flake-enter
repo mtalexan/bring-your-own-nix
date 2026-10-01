@@ -234,11 +234,25 @@ fi
 # If we're not using nix-portable (i.e. BYO_NIX is set), or locking is explicitly disabled,
 # then we don't need to worry about write locks on the store and we can just let the devShell
 # invocation do any store modifications automatically.
-if [ -z "$BYO_NIX" ] || [ -n "$BYO_NO_LOCK" ]; then
+if [ -z "$BYO_NIX" ] && [ -z "$BYO_NO_LOCK" ]; then
     
-    # This will create the store write-lock if it doesn't already exist!
-    _dry_run_output=$("$BYO_NIX_WRAPPER" build --dry-run "${_nix_devshell_attr}" 2>&1)
-    [ -n "$_dry_run_output" ] || die "Getting store status for flake devShell from: '$BYO_NIX_WRAPPER' build --dry-run  '${_nix_devshell_attr}'"
+    # Hold the store lock across the dry-run and any pre-build. nix-portable does not
+    # protect its own store, and a dry-run can initialize or update that store.
+    mkdir -p "$(dirname "$_nix_store_lockfile")" || die "Creating folder for nix-portable store lock: ${_nix_store_lockfile}"
+    if [ ! -f "$_nix_store_lockfile" ]; then
+        touch "$_nix_store_lockfile" || die "Creating nix-portable store write lock: ${_nix_store_lockfile}"
+    fi
+    exec 9>>"$_nix_store_lockfile"
+    flock -x 9
+
+    # Empty output from a successful dry-run means the devShell is already in the store.
+    # byo-nix would otherwise wait on the store lock this script already holds.
+    # Make sure we specify we already hold the write lock in case the store still has to be initialized too.
+    _dry_run_output=$(BYO_NIX_PORTABLE_STORE_LOCKED=1 "$BYO_NIX_WRAPPER" build --dry-run "${_nix_devshell_attr}" 2>&1) || {
+        exec 9>&-
+        die "Getting store status for flake devShell from: '$BYO_NIX_WRAPPER' build --dry-run  '${_nix_devshell_attr}'" "
+$_dry_run_output"
+    }
     
     _devshell_store_update=
     # don't really have a better way to query the status, there is no machine readable way
@@ -247,23 +261,27 @@ if [ -z "$BYO_NIX" ] || [ -n "$BYO_NO_LOCK" ]; then
     fi
     
     if [ -n "$_devshell_store_update" ]; then
-        # the --dry-run ensured the write lock already exists at a minimum, but double check just to be sure
-        [ -f "$_nix_store_lockfile" ] || die "During call to byo-nix, no nix-portable store write lock was created: ${BYO_NIX_WRAPPER}"
-        
-        # get/wait on the write lock
-        exec 9>>"$_nix_store_lockfile"
-        flock -x 9
+        # the wrapper can remove the lock to simulate a broken byo-nix; the open fd would
+        # still hold a lock on the unlinked file, so require the path itself.
+        [ -f "$_nix_store_lockfile" ] || {
+            exec 9>&-
+            die "During call to byo-nix, no nix-portable store write lock was created: ${BYO_NIX_WRAPPER}"
+        }
         
         # If we had to wait for the lock, someone may have built this same devShell.
         # However that will just cause the next command to complete really quickly, and won't be a problem.
         
         echo >&2 "Pre-building devShell for: ${_nix_devshell_attr}"
-        # use --no-link because we're just building it into the store
-        "$BYO_NIX_WRAPPER" build --no-link "${_nix_devshell_attr}" 1>&2 || die "Pre-building the devShell with: $BYO_NIX_WRAPPER build --no-link '${_nix_devshell_attr}'"
-        
-        # Release the write lock
-        exec 9>&-
+        # Use --no-link because we're just building it into the store.
+        # Make sure we specify we already hold the write lock in case the store still has to be initialized too.
+        BYO_NIX_PORTABLE_STORE_LOCKED=1 "$BYO_NIX_WRAPPER" build --no-link "${_nix_devshell_attr}" 1>&2 || {
+            exec 9>&-
+            die "Pre-building the devShell with: $BYO_NIX_WRAPPER build --no-link '${_nix_devshell_attr}'"
+        }
     fi
+
+    # Release the write lock before entering the devShell. The build is in the store.
+    exec 9>&-
 fi
 
 #-------------------------------

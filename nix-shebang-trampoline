@@ -216,8 +216,12 @@ is_in_pipe_list() {
 
     [ -z "$_list" ] && return 1
 
+    # Match the value literally. Set strings contain '|' and paths may contain
+    # other ERE metacharacters, which would otherwise split the pattern.
+    _value_re=$(printf '%s\n' "$_value" | sed -e 's/[.[\*^$()+?{|]/\\&/g')
+
     # Use start and end of string anchors, or pipe separator char to bound the value match
-    if echo "${_list}" | grep -qE "(^|[|])${_value}([|]|\$)" 1>/dev/null 2>&1; then
+    if echo "${_list}" | grep -qE "(^|[|])${_value_re}([|]|\$)" 1>/dev/null 2>&1; then
         return 0
     else
         return 1
@@ -283,7 +287,7 @@ build_compatible_flake_set_list() {
             IFS="$_old_ifs2"
             
         done
-        IFS="$old_ifs1"
+        IFS="$_old_ifs1"
         set +f # turn globbing back on (the default)
     fi
 
@@ -307,8 +311,9 @@ need_devshell_enter() {
 
     [ -n "$__NIX_SHEBANG_STACK" ] || return 0
 
-    _requested_flake_dir="$(get_flake_from_devshell_id "$_requested_dev")"
-    _compatible_flake_dirs_list="$(build_compatible_flake_set_list "$_requested_flake_dir")"
+    _requested_flake_dir="$(get_flake_from_devshell_id "$_requested_devShell")"
+    # die inside the function only exits this substitution, so propagate that failure.
+    _compatible_flake_dirs_list="$(build_compatible_flake_set_list "$_requested_flake_dir")" || exit 1
 
     set -f # turn off globbing so we can safely parse the list
     old_ifs="$IFS"

@@ -105,7 +105,14 @@
 #     Sharing a store between simultaneous nix-portable calls does not natively do any
 #     protection against simultaneous writes!
 #     It is up to the caller to provide protection against simultaneous writes if needed.
+#     The one exception is nix-portable's own first-use setup of the store (unpacking its
+#     bundled store paths and building gitMinimal), which this script detects and runs
+#     under the store write lock before the requested command.
 #     This value is ignored if BYO_NIX is set, since the system nix store is always used then.
+#   BYO_NIX_PORTABLE_STORE_LOCKED=(unset)
+#     Set by a caller that already holds the BYO_NIX_PORTABLE_STORE write lock when it calls
+#     this script. The first-use check then runs without taking that lock again, which would
+#     otherwise wait forever. It is not passed on to nix-portable.
 #   BYO_NO_LOCK=(unset)
 #     If set, no locking will be performed when downloading/checking the nix-portable and none
 #     will be created for the store. 
@@ -198,7 +205,7 @@ get_nix_portable() {
             dl_with_curl "${BYO_NIX_PORTABLE_URL}" "${_abs_dl_dest}" || return $?
         elif command -v wget 1>/dev/null 2>&1; then
             # handles only printing for BYO_SELF_TEST
-            dl_with_wget "${BYO_NIX_PORTABLE_URL}" "${_abs_dest}" || return $?
+            dl_with_wget "${BYO_NIX_PORTABLE_URL}" "${_abs_dl_dest}" || return $?
         else
             die "Downloading nix-portable; No curl or wget present, and no BYO_NIX_PORTABLE_DL_CMD defined"
         fi
@@ -288,7 +295,11 @@ bootstrap_nix_portable() {
         [ "$_rc" -eq 0 ] || return "$_rc"
     else
         if [ -n "$BYO_SELF_TEST" ]; then # found, not forced dl, and self-test
-            echo >&2 "nix-portable found at $_abs_dest"
+            if [ -x "$_abs_dest" ]; then
+                echo >&2 "nix-portable found at $_abs_dest"
+            else
+                echo >&2 "nix-portable missing execute permission"
+            fi
         else
             _not_executable=
             if [ -z "$BYO_SELF_TEST" ] && [ -z "$BYO_NO_LOCK" ]; then
@@ -351,12 +362,82 @@ bootstrap_nix_portable_store() {
     if ! [ -f "${_abs_store_dest_lock}" ]; then
         if [ -n "$BYO_SELF_TEST" ]; then
             echo >&2 "No lockfile for nix-portable store: ${_abs_store_dest_lock}"
-        else
+        elif [ -z "$BYO_NO_LOCK" ]; then
             touch "${_abs_store_dest_lock}" || die "Creating nix-portable store lockfile: ${_abs_store_dest_lock}"
         fi
     elif [ -n "$BYO_SELF_TEST" ] && [ -z "$BYO_NO_LOCK" ]; then
         echo >&2 "Lockfile for nix-portable store exists: ${_abs_store_dest_lock}"
     fi
+}
+
+# Checks whether the next nix-portable call will write to its store before running the
+# requested command. That happens the first time a given nix-portable binary uses a store:
+# it unpacks its bundled store paths, and because NP_GIT is not used, it builds gitMinimal.
+# The checks mirror the ones in the nix-portable script itself, using the fingerprint and
+# gitMinimal store path read from that script.
+# Args:
+#   1: Absolute path of the nix-portable binary
+#   2: Absolute path of the nix-portable store (NP_LOCATION)
+# Returns 0 when that first-use setup is still needed, or when it can't be determined.
+nix_portable_store_needs_init() {
+    _np_bin="$1"
+    _np_dir="$2/.nix-portable"
+
+    [ -f "$_np_bin" ] || return 0
+
+    _np_fingerprint=$(LC_ALL=C sed -n -e 's/^fingerprint="\([0-9a-f]*\)"$/\1/p' -e '/^fingerprint="/q' "$_np_bin" 2>/dev/null)
+    _np_git=$(LC_ALL=C sed -n -e 's@^if \$doInstallGit && \[ ! -e \$store/\([^ ]*\) \] ; then$@\1@p' -e '/^if \$doInstallGit && /q' "$_np_bin" 2>/dev/null)
+
+    { [ -n "$_np_fingerprint" ] && [ -n "$_np_git" ]; } || return 0
+    [ -f "$_np_dir/conf/fingerprint" ] || return 0
+    [ "$(cat "$_np_dir/conf/fingerprint")" = "$_np_fingerprint" ] || return 0
+    [ -e "$_np_dir/nix/store/$_np_git" ] || return 0
+    return 1
+}
+
+# Runs the nix-portable first-use setup for a store while holding the store write lock,
+# so it can't race with another nix-portable process writing to the same store.
+# The store write lock is held while checking, and released before returning.
+# Args:
+#   1: Absolute path of the nix-portable binary
+#   2: Absolute path of the nix-portable store, without trailing '/'
+# Environment:
+#   BYO_SELF_TEST: Only report whether the setup is needed.
+#   BYO_NO_LOCK: Skipped. nix-portable does any setup itself, unlocked, during the requested command.
+#   BYO_NIX_PORTABLE_STORE_LOCKED: The caller already holds the store write lock, so don't take it.
+init_nix_portable_store() {
+    _np_bin="$1"
+    _np_store="$2"
+    _np_store_lock="${_np_store}.lock"
+
+    if [ -n "$BYO_SELF_TEST" ]; then
+        if nix_portable_store_needs_init "$_np_bin" "$_np_store"; then
+            echo >&2 "nix-portable store needs first-use setup: ${_np_store}"
+        else
+            echo >&2 "nix-portable store first-use setup done: ${_np_store}"
+        fi
+        return 0
+    fi
+
+    [ -z "$BYO_NO_LOCK" ] || return 0
+
+    _np_locked=
+    if [ -z "$BYO_NIX_PORTABLE_STORE_LOCKED" ]; then
+        exec 9>>"${_np_store_lock}" || die "Opening nix-portable store lockfile: ${_np_store_lock}"
+        flock -x 9
+        _np_locked=1
+    fi
+
+    if nix_portable_store_needs_init "$_np_bin" "$_np_store"; then
+        echo >&2 "Initializing nix-portable store: ${_np_store}"
+        # Any nix-portable call does the setup before running its command.
+        NP_LOCATION="${_np_store}" "$_np_bin" nix --version 1>&2 || {
+            [ -z "$_np_locked" ] || exec 9>&-
+            die "Initializing nix-portable store: ${_np_store}"
+        }
+    fi
+
+    [ -z "$_np_locked" ] || exec 9>&-
 }
 
 #------------------------------------------------------------------------------------
@@ -398,11 +479,21 @@ else # nix-portable
     if [ -z "$BYO_ONLY_GET" ]; then
         bootstrap_nix_portable_store "${_nix_store_path}" || die "Ensuring nix-portable store can be used"
 
+        # We cannot use NP_GIT to specify our own already-installed git. nix-portable can't
+        # be sure it doesn't change between different calls, so it always unconditionally
+        # replaces a symlink in the store folder on every call. This makes it unsafe to use
+        # for shared stores.
+        unset NP_GIT
+        # This detects if the store has been initialized yet and if not will initialize it. It
+        # uses the store write lock for this.
+        # If we're called from a script that also needed the write lock, it should have set
+        # BYO_NIX_PORTABLE_STORE_LOCKED so we inherit that lock instead of grabbing it independently.
+        init_nix_portable_store "${_nix_portable_path}" "${_abs_store_dest}"
+
+        # Make sure this doesn't follow into the nix command environment we're actually running.
+        unset BYO_NIX_PORTABLE_STORE_LOCKED
+
         if [ -z "$BYO_SELF_TEST" ]; then
-            # nix-portable requires git, and will install it on the first call if we don't tell it where to find an existing one.
-            # Use the system one if present, otherwise this is blank and nix-portable will install it itself.
-            NP_GIT=$(command -v git 2>/dev/null)
-            export NP_GIT
             # nix-portable uses the environment variable NP_LOCATION to define where the store should be
             NP_LOCATION="${_nix_store_path}"
             export NP_LOCATION
