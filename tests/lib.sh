@@ -24,7 +24,27 @@ reset_env() {
         NP_GIT NP_LOCATION BYO_NIX_PORTABLE_STORE_LOCKED __BYO_NIX_INSIDE_STORE \
         BYO_TEST_DL_SLEEP BYO_TEST_DL_FAIL BYO_TEST_DRY BYO_TEST_SLEEP \
         BYO_TEST_LOG BYO_TEST_LOCK BYO_TEST_REAL_BYO BYO_TEST_ENTER_LOG \
-        BYO_TEST_REAL_ENTER BYO_TEST_STUB BYO_TEST_RECORD
+        BYO_TEST_REAL_ENTER BYO_TEST_STUB BYO_TEST_RECORD \
+        NSCD_SOCKET
+}
+
+# Stop processes whose command line contains the needle. Reads /proc so the
+# suite does not need pkill. The second argument is a pid to leave alone.
+kill_matching() {
+    _needle=$1
+    _spare=${2:-$$}
+    for _cmdfile in /proc/[0-9]*/cmdline; do
+        [ -r "$_cmdfile" ] || continue
+        _pid=${_cmdfile#/proc/}
+        _pid=${_pid%/cmdline}
+        [ "$_pid" = "$_spare" ] && continue
+        _cmd=$(tr '\0' ' ' < "$_cmdfile" 2>/dev/null) || continue
+        case "$_cmd" in
+            *"$_needle"*)
+                kill "$_pid" 2>/dev/null || true
+                ;;
+        esac
+    done
 }
 
 new_work() {

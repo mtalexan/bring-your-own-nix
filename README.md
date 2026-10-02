@@ -72,6 +72,8 @@ It is safe to perform any number of read operations of existing content from a s
 
 When `byo-nix` is already running inside that store's nix-portable sandbox, it executes the `nix` binary from the store instead of starting nix-portable again. A second nix-portable would nest proot or bubblewrap. Nested proot cannot set `PTRACE_O_TRACESECCOMP`, and then either cannot find the nix binary or fails with `Operation not permitted` while reading store paths. Entering another devShell from a shebang that is already inside one is that case. `byo-nix` records the store path in `__BYO_NIX_INSIDE_STORE` when it starts nix-portable, and a later call for that same store uses the store `nix` directly. The store `nix` is only used when `/nix/store` is this portable store, so a system nix store is left alone.
 
+The nix-portable initial store setup may run under an older host proot. Ubuntu 24.04's proot 5.1.0 is one of those: it returns `Operation not permitted`, or crashes, when another nix command runs inside that same proot. Setup is only one nix-portable invocation, and the store's own proot does not exist until that invocation unpacks it. After the store is initialized, later commands use the newest proot available between the host and the store.
+
 **Note:** The first use of nix-portable is a store write to do initial store population. It must protect that initial setup, which requires holding the write-lock. Callers of the script that already hold the write lock need to set `BYO_NIX_PORTABLE_STORE_LOCKED` to avoid deadlocks.
 
 #### `byo-nix` Use Cases
@@ -155,11 +157,11 @@ nix-flake-enter . "" bash
 nix-flake-enter . isolatedPodmanShell podman info
 ```
 
-### `nix-shebang-trampoline`
+### `nix-bang`
 
-For use in the shebang of scripts, this wraps `nix-flake-enter` and manages whether or not the requested flake devShell is already the current environment.  
+For use in the shebang of scripts, this wraps `nix-flake-enter` and manages whether or not the requested flake devShell is already part of the current environment.
 
-When using a script like this in the shebang of some tool, it's likely that it might call another tool that also uses this in its shebang. When both those tools are within the same project, there's a very good chance the devShell being requested in both tools is the same one. However it may have called a tool that needs a different devShell instead, and that tool may then call a tool that needs the first devShell back. This leads to an effective stack of nested devShells that need to be tracked to determine if a newly requested devShell is already the one we're in or not, and for simply acting as a passthru for the original command when we're already in the correct devShell.
+**WARNING:** Some environments only keep the first 127 characters of a shebang line. proot is one of them, and nix-portable uses proot when bubblewrap is not available. A longer `env -S` line is cut off inside the quotes, and `env` exits 125 with `no terminating quote in -S string`. The kernel and bubblewrap allow a longer line, so the failure appears when another shebang script is started from inside that proot.
 
 Unfortunately the syntax of shebangs is limited and there's no way to reference a path relative to the calling directory or script the shebang is in for picking the interpreter. The solution is that a `sh`, `bash` or similar interpreter be specified in the shebang, but with arguments that direct it to run this script from its relative path using a specific interpreter.  Shebang lines are entirely ignored if an interpreter is explicitly specified, so this avoids this script accidentally calling itself recursively.
 
@@ -170,8 +172,10 @@ The arguments to this script are:
 4. The first argument to that interpreter. In a shebang this is always `"$0"`, the script being executed.
 5. (and all additional arguments) Arguments for the interpreter. In a shebang this is always `"$@"`.
 
+When using a script like this in the shebang of a tool, it's likely that it might call another tool that also uses this in its shebang. When both those tools are within the same project, there's a very good chance the devShell being requested in both tools is the same one. However it may have called a tool that needs a different devShell instead, and that tool may then call a tool that needs the first devShell back. This leads to an effective stack of nested devShells that need to be tracked to determine if a newly requested devShell is already part of the one we're in or not, and for simply acting as a passthru for the original command when we're already in the correct devShell.
+
 You may call other scripts that use this special shebang from within scripts that also use it, even if they need different flakes and/or devShells. The overhead for entering the devShell is skipped if it's not needed. \
-The flake-specific devShells you've already entered are tracked as a call stack in a reserved `__NIX_SHEBANG_STACK` environment variable. The flakes are identified by their absolute path without symlink resolution, so they can only be matched if they aren't accessed via a different symlink. \
+The flake-specific devShells you've already entered are tracked as a call stack in a reserved `__NIX_SHEBANG_STACK` environment variable. Each stack entry is `${flake_abs_path}#${devShell}`, where `${flake_abs_path}` is the absolute path of the directory containing `flake.nix`, not the path to the `flake.nix` file itself. The devShell name is the same as in `NIX_SHEBANG_DEVSHELL_MERGE`: the output name only, without the `devShells.<system>.` prefix, and `default` for the default devShell. The flake's absolute path must not have symlinks resolved, so the same flake reached through a different symlink does not match. A trailing `/` on the flake directory is ignored. \
 There are 3 possibilities for what needs to happen, with the `NIX_SHEBANG_DEVSHELL_MERGE` environment variable controlling how one of the possibilities is handled:
 1. The flake+devShell is not in the stack: build and enter it.
 2. The flake+devShell is already at the top of the stack: we don't need to re-enter.
@@ -179,7 +183,7 @@ There are 3 possibilities for what needs to happen, with the `NIX_SHEBANG_DEVSHE
    1. If `NIX_SHEBANG_DEVSHELL_MERGE` indicates the flake+devShells between the top and the one we need are "mergeable", we don't need to re-enter.
    2. Otherwise, we re-enter.
 
-`NIX_SHEBANG_DEVSHELL_MERGE` is a comma-separated list of pipe-separated flake+devShells. Each flake+devShell is of the form `${flake_abs_path}#${devShell}`. The default devShell is simplified to just `default`. The flake's absolute path must not have symlinks resolved, and empty comma-separated values are silently ignored, including leading and trailing ones, to make the list easier to generate programmatically. \
+`NIX_SHEBANG_DEVSHELL_MERGE` is a comma-separated list of pipe-separated flake+devShells. Each entry is either `${flake_abs_path}#${devShell}` or, as shorthand, only `${flake_abs_path}`. `${flake_abs_path}` is the absolute path of the directory containing `flake.nix` (for example `/home/me/project/flake_dir#default`, not `/home/me/project/flake_dir/flake.nix#default`). The default devShell is simplified to just `default`. A bare directory means every devShell in that flake is independent of the other entries in that pipe-separated set. Naming one devShell, such as `flake_dir#default`, does not cover the other devShells in that flake. The flake's absolute path must not have symlinks resolved. A trailing `/` on that directory is ignored, so `/home/me/project/flake_dir` and `/home/me/project/flake_dir/` are the same flake. Empty comma-separated values are silently ignored, including leading and trailing ones, to make the list easier to generate programmatically. \
 Each comma-separated set of pipe-separated flake+devShells is a declaration that those flake+devShells can be entered in any order and will always produce the same effective resulting devShell. In other words, each of them only makes non-overlapping changes. \
 The benefit of specifying this when known is that it can significantly reduce the overhead of flake+devShell re-entry when using scripts with shebangs that call each other back and forth between different flakes and/or devShells. A simple example is if `scriptA` and `scriptC` need `${PWD}#devShell1` and `scriptB` needs `${PWD}#devShell2`. If `scriptA` calls `scriptB` which calls `scriptC` you can eliminate re-entering `${PWD}#devShell1` when executing `scriptC` because you already entered it for `scriptA` and overlaying `${PWD}#devShell2` for `scriptB` doesn't conflict with it.
 
@@ -190,39 +194,36 @@ Environment variables:
 - `NIX_SHEBANG_DEVSHELL_MERGE` is the comma-separated list of mergeable sets described above.
 - `__NIX_SHEBANG_STACK` is reserved for the devShell stack. Leave it unset in the environment you start from.
 
-#### `nix-shebang-trampoline` Use Cases
+#### `nix-bang` Use Cases
 
-_Put `nix-shebang-trampoline` in the shebang of a script whose interpreter lives in a flake devShell, including when that script may call another script that wants the same devShell or a different one._
+_Put `nix-bang` in the shebang of a script whose interpreter lives in a flake devShell, including when that script may call another script that wants the same devShell or a different one._
 
-These examples assume the three utilities live in a `tools/` directory next to the script, and the flake is in `flake_dir` next to the script. The merge paths are computed the same way this script absolutizes its flake argument, so the text matches.
+Compute the script directory once, then use paths relative to it for both `nix-bang` and the flake. This keeps the line short without changing the script's working directory. These examples assume the three utilities live in a `tools/` directory next to the script, and the flake is in `flake_dir` next to the script. Merge paths are absolute and do not resolve symlinks, so the text matches the path given to `nix-bang`.
 
 - As the shebang of a Python script, using the default devShell.
 
 ```shell
-#!/usr/bin/env -S sh -c '"$(dirname "$0")"/tools/nix-shebang-trampoline "$(dirname "$0")/flake_dir" "" python3 "$0" "$@"'
+#!/usr/bin/env -S sh -c 'd=$(dirname "$0");"$d"/tools/nix-bang "$d"/flake_dir "" python3 "$0" "$@"'
 ```
 
 - As the shebang of a Ruby script, using a named devShell.
 
 ```shell
-#!/usr/bin/env -S sh -c '"$(dirname "$0")"/tools/nix-shebang-trampoline "$(dirname "$0")/flake_dir" "myRubyShell" ruby "$0" "$@"'
+#!/usr/bin/env -S sh -c 'd=$(dirname "$0");"$d"/tools/nix-bang "$d"/flake_dir rubyDev ruby "$0" "$@"'
 ```
 
 - As a direct call, using the flake in the current directory to run a command in a named devShell. The interpreter and its first argument are still required.
 
 ```shell
-./tools/nix-shebang-trampoline . "isolatedPodmanShell" podman info
+./tools/nix-bang . "isolatedPodmanShell" podman info
 ```
 
-- As the shebang of a shell script whose flake contains only independent devShells, so they may be overlaid in any order.
+- When flakes are independent, set `NIX_SHEBANG_DEVSHELL_MERGE` in the environment, then use the regular shebang. A bare directory covers every devShell in that flake. Paths are absolute and do not resolve symlinks.
 
 ```shell
-#!/usr/bin/env -S sh -c 'NIX_SHEBANG_DEVSHELL_MERGE="${NIX_SHEBANG_DEVSHELL_MERGE},$(cd "$(dirname "$0")/flake_dir" && pwd)" "$(dirname "$0")"/tools/nix-shebang-trampoline "$(dirname "$0")/flake_dir" "" bash "$0" "$@"'
+export NIX_SHEBANG_DEVSHELL_MERGE="/proj/flake_dir|/proj/flake_dirA|/proj/flake_dirB"
 ```
-
-- As the shebang of a shell script where every devShell in `flake_a` and `flake_b` is independent of the others, so those two flakes may be overlaid in any order. The script itself uses `flake_a`.
 
 ```shell
-#!/usr/bin/env -S sh -c 'd=$(dirname "$0"); NIX_SHEBANG_DEVSHELL_MERGE="${NIX_SHEBANG_DEVSHELL_MERGE},$(cd "$d/flake_a" && pwd)|$(cd "$d/flake_b" && pwd)" "$d"/tools/nix-shebang-trampoline "$d/flake_a" "" bash "$0" "$@"'
+#!/usr/bin/env -S sh -c 'd=$(dirname "$0");"$d"/tools/nix-bang "$d"/flake_dir "" bash "$0" "$@"'
 ```
-

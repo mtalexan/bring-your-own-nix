@@ -117,6 +117,18 @@
 #     enters another devShell from inside one hits this. __BYO_NIX_INSIDE_STORE is
 #     set by this script to the store path when it starts nix-portable, so a later
 #     call can recognize that sandbox without consulting the shebang stack.
+#     Proot selection has two steps, because the store's own proot does not
+#     exist until nix-portable has unpacked it:
+#       1. The nix-portable initial store setup may run under an older host
+#          proot that has known bugs. Ubuntu 24.04's proot 5.1.0 is one: it
+#          returns "Operation not permitted" or crashes when another nix
+#          command runs inside that same proot. Setup is a single nix-portable
+#          invocation, so it does not hit that bug. NP_PROOT, or a proot on
+#          PATH, is used for this step when the store copy is not there yet.
+#       2. After the store is initialized, the rest of the logic runs using the
+#          newest proot available between the host and the store. The store
+#          copy replaces an older host proot. A host proot that is the same
+#          version or newer is kept.
 #   BYO_NIX_PORTABLE_STORE_LOCKED=(unset)
 #     Set by a caller that already holds the BYO_NIX_PORTABLE_STORE write lock when it calls
 #     this script. The first-use check then runs without taking that lock again, which would
@@ -452,6 +464,58 @@ nix_binary_inside_portable_store() {
     return 1
 }
 
+# Prints the version from `proot --version`, or 0 when it cannot be read.
+# Args:
+#   1: proot executable
+proot_version() {
+    _proot_version_bin="$1"
+    _proot_version_text=$("$_proot_version_bin" --version 2>/dev/null) || _proot_version_text=
+    _proot_version_text=$(printf '%s\n' "$_proot_version_text" | sed -n 's/.*| \([0-9][0-9.]*\)$/\1/p' | head -n 1)
+    if [ -n "$_proot_version_text" ]; then
+        printf '%s\n' "$_proot_version_text"
+    else
+        printf '%s\n' 0
+    fi
+}
+
+# Points NP_PROOT at the newest proot among the caller's choice, PATH, and the
+# copy nix-portable unpacked into this store.
+# Before that copy exists, this leaves the host proot in place. The initial
+# store setup then runs under that host proot, which may be an older one with
+# known bugs, such as Ubuntu 24.04's proot 5.1.0. Call this again after setup.
+# The store copy is there by then, and a newer store copy replaces the host
+# proot for every later nix-portable command. A host proot that is the same
+# version or newer is kept.
+# Args:
+#   1: Absolute nix-portable store path, without a trailing slash
+prefer_newer_proot() {
+    _proot_store_bin="$1/.nix-portable/bin/proot"
+    _proot_best=
+    _proot_best_ver=
+    _proot_from_path=$(command -v proot 2>/dev/null || true)
+
+    for _proot_candidate in ${NP_PROOT:+"$NP_PROOT"} ${_proot_from_path:+"$_proot_from_path"} ${_proot_store_bin:+"$_proot_store_bin"}; do
+        [ -n "$_proot_candidate" ] || continue
+        [ -x "$_proot_candidate" ] || continue
+        _proot_ver=$(proot_version "$_proot_candidate")
+        if [ -z "$_proot_best" ]; then
+            _proot_best=$_proot_candidate
+            _proot_best_ver=$_proot_ver
+            continue
+        fi
+        _proot_higher=$(printf '%s\n%s\n' "$_proot_best_ver" "$_proot_ver" | sort -V | tail -n 1)
+        if [ "$_proot_higher" = "$_proot_ver" ] && [ "$_proot_ver" != "$_proot_best_ver" ]; then
+            _proot_best=$_proot_candidate
+            _proot_best_ver=$_proot_ver
+        fi
+    done
+
+    if [ -n "$_proot_best" ]; then
+        NP_PROOT=$_proot_best
+        export NP_PROOT
+    fi
+}
+
 # nix-portable puts its gitMinimal on PATH. A devShell replaces PATH, so a later
 # nix started inside that devShell needs the same git prepended again.
 # Args:
@@ -583,7 +647,13 @@ else # nix-portable
         # uses the store write lock for this.
         # If we're called from a script that also needed the write lock, it should have set
         # BYO_NIX_PORTABLE_STORE_LOCKED so we inherit that lock instead of grabbing it independently.
+        # The store copy of proot is unpacked by the initial setup, so the first
+        # choice can only see the host proot. Setup itself runs under that proot.
+        # The second choice sees the unpacked copy and switches to it when it
+        # is newer than the host proot. The requested command uses that result.
+        prefer_newer_proot "${_abs_store_dest}"
         init_nix_portable_store "${_nix_portable_path}" "${_abs_store_dest}"
+        prefer_newer_proot "${_abs_store_dest}"
 
         # Make sure this doesn't follow into the nix command environment we're actually running.
         unset BYO_NIX_PORTABLE_STORE_LOCKED

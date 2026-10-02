@@ -69,47 +69,19 @@ EOF
     assert_rc "unknown uname" "$rc" 1
     assert_contains "unknown uname message" "$text" "Unrecognized host system type"
 
-    if unshare --mount --map-root-user true >"$WORK/unshare.out" 2>"$WORK/unshare.err"; then
-        unshare --mount --map-root-user sh -c '
-            empty=$1
-            enter=$2
-            flake=$3
-            out=$4
-            err=$5
-            rcfile=$6
-            mkdir -p "$empty"
-            if [ -d /var/run/nscd ]; then
-                mount --bind "$empty" /var/run/nscd || exit 90
-            else
-                mkdir -p /var/run/nscd
-                mount -t tmpfs tmpfs /var/run/nscd || exit 90
-            fi
-            if [ -S /var/run/nscd/socket ]; then
-                exit 91
-            fi
-            "$enter" "$flake" "" true >"$out" 2>"$err"
-            printf "%s\n" "$?" > "$rcfile"
-        ' sh "$WORK/empty-nscd" "$ENTER" "$ROOT" "$WORK/nscd.out" "$WORK/nscd.err" "$WORK/nscd.rc"
-        hide_rc=$?
-        if [ "$hide_rc" -eq 0 ]; then
-            nscd_rc=$(cat "$WORK/nscd.rc")
-            nscd_text=$(cat "$WORK/nscd.out" "$WORK/nscd.err")
-            assert_rc "hidden nscd socket fails" "$nscd_rc" 1
-            assert_contains "hidden nscd message" "$nscd_text" "nscd or nsncd are required"
-            assert_not_contains "hidden nscd does not call nix" "$nscd_text" "Pre-building devShell"
-        else
-            fail "hidden nscd socket" "unshare mount failed ($hide_rc)
-$(cat "$WORK/nscd.err" 2>/dev/null)"
-        fi
-    else
-        fail "hidden nscd socket" "unshare unavailable
-$(cat "$WORK/unshare.err")"
-    fi
+    export NSCD_SOCKET=$WORK/no-nscd-socket
+    run_enter "$ROOT" "" true
+    rc=$?
+    unset NSCD_SOCKET
+    text=$(captured)
+    assert_rc "missing nscd socket fails" "$rc" 1
+    assert_contains "missing nscd message" "$text" "nscd or nsncd are required"
+    assert_not_contains "missing nscd does not pre-build" "$text" "Pre-building devShell"
 
     reset_env
     new_work
     run_tramp() {
-        "$TRAMP" "$@" >"$BYO_TEST_STDOUT" 2>"$BYO_TEST_STDERR"
+        "$BANG" "$@" >"$BYO_TEST_STDOUT" 2>"$BYO_TEST_STDERR"
     }
     export NIX_FLAKE_ENTER_WRAPPER=$WORK/missing-enter
     run_tramp "$ROOT" "" /bin/echo "$WORK/script"
@@ -205,18 +177,27 @@ EOF
     fi
 
     : > "$WORK/enter.log"
-    export NIX_SHEBANG_DEVSHELL_MERGE="$flake_a"
+    export NIX_SHEBANG_DEVSHELL_MERGE="$flake_a#default"
     run_tramp "$flake_a" "" /bin/echo marker
-    text=$(cat "$BYO_TEST_STDOUT")
-    assert_contains "merge same flake runs interpreter" "$text" "marker"
-    if [ ! -s "$WORK/enter.log" ]; then
-        pass "merge same flake skips enter"
+    if [ -s "$WORK/enter.log" ]; then
+        pass "unlisted named devShell forces enter"
     else
-        fail "merge same flake skips enter" "$(cat "$WORK/enter.log")"
+        fail "unlisted named devShell forces enter"
     fi
 
     : > "$WORK/enter.log"
-    export NIX_SHEBANG_DEVSHELL_MERGE=",$flake_a,"
+    export NIX_SHEBANG_DEVSHELL_MERGE="$flake_a#cowsay|$flake_a#default"
+    run_tramp "$flake_a" "" /bin/echo marker
+    text=$(cat "$BYO_TEST_STDOUT")
+    assert_contains "merge listed devShells runs interpreter" "$text" "marker"
+    if [ ! -s "$WORK/enter.log" ]; then
+        pass "merge listed devShells skips enter"
+    else
+        fail "merge listed devShells skips enter" "$(cat "$WORK/enter.log")"
+    fi
+
+    : > "$WORK/enter.log"
+    export NIX_SHEBANG_DEVSHELL_MERGE=",$flake_a#cowsay|$flake_a#default,"
     run_tramp "$flake_a" "" /bin/echo marker
     if [ ! -s "$WORK/enter.log" ]; then
         pass "blank comma merge entries ignored"
@@ -224,16 +205,119 @@ EOF
         fail "blank comma merge entries ignored" "$(cat "$WORK/enter.log")"
     fi
 
-    export NIX_SHEBANG_DEVSHELL_MERGE="$flake_a||$flake_b"
+    : > "$WORK/enter.log"
+    export NIX_SHEBANG_DEVSHELL_MERGE="$flake_a"
+    export __NIX_SHEBANG_STACK="$flake_a#cowsay|$flake_a#default|"
+    run_tramp "$flake_a" "" /bin/echo marker
+    text=$(cat "$BYO_TEST_STDOUT")
+    assert_contains "flake dir shorthand runs interpreter" "$text" "marker"
+    if [ ! -s "$WORK/enter.log" ]; then
+        pass "flake dir shorthand skips enter"
+    else
+        fail "flake dir shorthand skips enter" "$(cat "$WORK/enter.log")"
+    fi
+
+    : > "$WORK/enter.log"
+    export NIX_SHEBANG_DEVSHELL_MERGE=",$flake_a,"
+    run_tramp "$flake_a" "" /bin/echo marker
+    if [ ! -s "$WORK/enter.log" ]; then
+        pass "blank comma around flake dir shorthand ignored"
+    else
+        fail "blank comma around flake dir shorthand ignored" "$(cat "$WORK/enter.log")"
+    fi
+
+    : > "$WORK/enter.log"
+    export NIX_SHEBANG_DEVSHELL_MERGE="$flake_a"
+    export __NIX_SHEBANG_STACK="$flake_b#default|$flake_a#default|"
+    run_tramp "$flake_a" "" /bin/echo marker
+    if [ -s "$WORK/enter.log" ]; then
+        pass "flake dir shorthand does not cover another flake"
+    else
+        fail "flake dir shorthand does not cover another flake"
+    fi
+
+    : > "$WORK/enter.log"
+    export NIX_SHEBANG_DEVSHELL_MERGE="$flake_a|$flake_b#default"
+    export __NIX_SHEBANG_STACK="$flake_b#cowsay|$flake_a#default|"
+    run_tramp "$flake_a" "" /bin/echo marker
+    if [ -s "$WORK/enter.log" ]; then
+        pass "named entry does not cover other shells in that flake"
+    else
+        fail "named entry does not cover other shells in that flake"
+    fi
+
+    : > "$WORK/enter.log"
+    export NIX_SHEBANG_DEVSHELL_MERGE="$flake_a|$flake_b#default"
+    export __NIX_SHEBANG_STACK="$flake_b#default|$flake_a#cowsay|"
+    run_tramp "$flake_a" cowsay /bin/echo marker
+    text=$(cat "$BYO_TEST_STDOUT")
+    assert_contains "mixed shorthand runs interpreter" "$text" "marker"
+    if [ ! -s "$WORK/enter.log" ]; then
+        pass "bare flake dir mixes with a named devShell"
+    else
+        fail "bare flake dir mixes with a named devShell" "$(cat "$WORK/enter.log")"
+    fi
+
+    : > "$WORK/enter.log"
+    unset __NIX_SHEBANG_STACK
+    unset NIX_SHEBANG_DEVSHELL_MERGE
+    run_tramp "$flake_a/" "" /bin/echo marker
+    enter_log=$(cat "$WORK/enter.log")
+    if printf '%s\n' "$enter_log" | grep -F -x -q "ARG<$flake_a>"; then
+        pass "trailing slash argument is recorded without the slash"
+    else
+        fail "trailing slash argument is recorded without the slash" "$enter_log"
+    fi
+
+    : > "$WORK/enter.log"
+    export NIX_SHEBANG_DEVSHELL_MERGE="$flake_a/"
+    export __NIX_SHEBANG_STACK="$flake_a#cowsay|$flake_a#default|"
+    run_tramp "$flake_a" "" /bin/echo marker
+    if [ ! -s "$WORK/enter.log" ]; then
+        pass "trailing slash on flake dir shorthand is ignored"
+    else
+        fail "trailing slash on flake dir shorthand is ignored" "$(cat "$WORK/enter.log")"
+    fi
+
+    : > "$WORK/enter.log"
+    export NIX_SHEBANG_DEVSHELL_MERGE="$flake_a/#cowsay|$flake_a/#default"
+    run_tramp "$flake_a/" "" /bin/echo marker
+    text=$(cat "$BYO_TEST_STDOUT")
+    assert_contains "trailing slash on named devShell runs interpreter" "$text" "marker"
+    if [ ! -s "$WORK/enter.log" ]; then
+        pass "trailing slash on named devShell is ignored"
+    else
+        fail "trailing slash on named devShell is ignored" "$(cat "$WORK/enter.log")"
+    fi
+
+    : > "$WORK/enter.log"
+    export NIX_SHEBANG_DEVSHELL_MERGE="$flake_a"
+    export __NIX_SHEBANG_STACK="$flake_a/#cowsay|$flake_a/#default|"
+    run_tramp "$flake_a" "" /bin/echo marker
+    if [ ! -s "$WORK/enter.log" ]; then
+        pass "trailing slash on stack entry is ignored"
+    else
+        fail "trailing slash on stack entry is ignored" "$(cat "$WORK/enter.log")"
+    fi
+
+    export NIX_SHEBANG_DEVSHELL_MERGE="$flake_a#"
+    export __NIX_SHEBANG_STACK="$flake_a#default|"
+    run_tramp "$flake_a" "" /bin/echo marker
+    rc=$?
+    text=$(captured)
+    assert_rc "merge entry with empty devShell name" "$rc" 1
+    assert_contains "merge entry form message" "$text" "absolute_flake_path#devShell"
+
+    export NIX_SHEBANG_DEVSHELL_MERGE="$flake_a#default||$flake_b#default"
     export __NIX_SHEBANG_STACK="$flake_a#default|"
     run_tramp "$flake_a" "" /bin/echo marker
     rc=$?
     text=$(captured)
     assert_rc "blank pipe merge entry" "$rc" 1
-    assert_contains "blank pipe message" "$text" "pipe-separated flake set entries cannot be blank"
+    assert_contains "blank pipe message" "$text" "pipe-separated flake+devShell entries cannot be blank"
 
     : > "$WORK/enter.log"
-    export NIX_SHEBANG_DEVSHELL_MERGE="$flake_a|$flake_b,$flake_b|$flake_c"
+    export NIX_SHEBANG_DEVSHELL_MERGE="$flake_a#default|$flake_b#default,$flake_b#default|$flake_c#default"
     export __NIX_SHEBANG_STACK="$flake_c#default|$flake_a#default|"
     run_tramp "$flake_a" "" /bin/echo marker
     if [ -s "$WORK/enter.log" ]; then
@@ -270,6 +354,24 @@ EOF
         pass "incompatible flake on top forces enter"
     else
         fail "incompatible flake on top forces enter"
+    fi
+
+    # These scripts can be exec'd from inside nix-portable's proot. Ubuntu
+    # 24.04 ships proot 5.1.0, which keeps only the first 127 characters of a
+    # shebang. A longer env -S line loses its closing quote and exits 125.
+    _long=
+    for _shebang in "$ROOT/hello.nims" "$ROOT/nested/"*.sh; do
+        _line=$(head -n 1 "$_shebang")
+        _len=${#_line}
+        if [ "$_len" -gt 127 ]; then
+            _long="${_long}$(basename "$_shebang") ${_len}
+"
+        fi
+    done
+    if [ -z "$_long" ]; then
+        pass "test shebangs fit in proot"
+    else
+        fail "test shebangs fit in proot" "$_long"
     fi
 
     reset_env
