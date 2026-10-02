@@ -81,7 +81,7 @@ EOF
     reset_env
     new_work
     run_tramp() {
-        "$TRAMP" "$@" >"$BYO_TEST_STDOUT" 2>"$BYO_TEST_STDERR"
+        "$BANG" "$@" >"$BYO_TEST_STDOUT" 2>"$BYO_TEST_STDERR"
     }
     export NIX_FLAKE_ENTER_WRAPPER=$WORK/missing-enter
     run_tramp "$ROOT" "" /bin/echo "$WORK/script"
@@ -354,6 +354,24 @@ EOF
         pass "incompatible flake on top forces enter"
     else
         fail "incompatible flake on top forces enter"
+    fi
+
+    # These scripts can be exec'd from inside nix-portable's proot. Ubuntu
+    # 24.04 ships proot 5.1.0, which keeps only the first 127 characters of a
+    # shebang. A longer env -S line loses its closing quote and exits 125.
+    _long=
+    for _shebang in "$ROOT/hello.nims" "$ROOT/nested/"*.sh; do
+        _line=$(head -n 1 "$_shebang")
+        _len=${#_line}
+        if [ "$_len" -gt 127 ]; then
+            _long="${_long}$(basename "$_shebang") ${_len}
+"
+        fi
+    done
+    if [ -z "$_long" ]; then
+        pass "test shebangs fit in proot"
+    else
+        fail "test shebangs fit in proot" "$_long"
     fi
 
     reset_env

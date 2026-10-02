@@ -267,7 +267,7 @@ functional() {
     reset_env
     new_work
     export BYO_NIX=/bin/echo
-    "$TRAMP" "$ROOT" "" /bin/echo marker >"$BYO_TEST_STDOUT" 2>"$BYO_TEST_STDERR"
+    "$BANG" "$ROOT" "" /bin/echo marker >"$BYO_TEST_STDOUT" 2>"$BYO_TEST_STDERR"
     rc=$?
     text=$(captured)
     assert_rc "default enter wrapper status" "$rc" 0
@@ -474,6 +474,123 @@ $(cat "$BYO_TEST_ENTER_LOG")"
         export NP_RUNTIME
     else
         unset NP_RUNTIME
+    fi
+
+    # Empty store, with the host proot forced. Setup has to be able to finish
+    # under that proot. The command after setup has to use the newer of the
+    # host proot and the proot unpacked into the store.
+    if [ -n "${BYO_TEST_SKIP_PROOT:-}" ]; then
+        printf 'SKIP cold proot store (--skip-proot)\n'
+    else
+        printf 'RUN cold proot store\n'
+        coldp=/tmp/byo-coldp
+        if [ -e "$coldp" ]; then
+            chmod -R u+w "$coldp" 2>/dev/null || true
+            rm -rf "$coldp"
+        fi
+        mkdir -p "$coldp"
+        cp -a "$cache/nix-portable" "$coldp/nix-portable"
+        chmod a+x "$coldp/nix-portable"
+        _coldp_saved_runtime=${NP_RUNTIME-}
+        _coldp_saved_proot=${NP_PROOT-}
+        _coldp_saved_debug=${NP_DEBUG-}
+        # The proot this run is allowed to start with. Setup runs before the
+        # store copy exists, so this is the proot that setup uses, unless a
+        # proot on PATH is strictly newer.
+        _coldp_forced=${NP_PROOT:-$(command -v proot)}
+        _coldp_path_proot=$(command -v proot 2>/dev/null || true)
+        unset BYO_NIX BYO_NIX_WRAPPER
+        export BYO_NIX_PORTABLE=$coldp/nix-portable
+        export BYO_NIX_PORTABLE_STORE=$coldp/nix-store
+        export NP_RUNTIME=proot
+        export NP_PROOT=$_coldp_forced
+        export NP_DEBUG=1
+        # Setup's nix-portable stdout is redirected to stderr, so its
+        # "proot executable:" line lands in coldp.err. The requested command's
+        # line lands in coldp.out.
+        # byo-nix supplies the leading "nix" argument to nix-portable.
+        "$BYO" --version >"$WORK/coldp.out" 2>"$WORK/coldp.err"
+        _coldp_rc=$?
+        unset NP_DEBUG
+        if [ -n "$_coldp_saved_debug" ]; then
+            NP_DEBUG=$_coldp_saved_debug
+            export NP_DEBUG
+        fi
+        if [ -n "$_coldp_saved_runtime" ]; then
+            NP_RUNTIME=$_coldp_saved_runtime
+            export NP_RUNTIME
+        else
+            unset NP_RUNTIME
+        fi
+        if [ -n "$_coldp_saved_proot" ]; then
+            NP_PROOT=$_coldp_saved_proot
+            export NP_PROOT
+        else
+            unset NP_PROOT
+        fi
+        _coldp_store_proot=$coldp/nix-store/.nix-portable/bin/proot
+        _coldp_init_proot=$(sed -n 's/^proot executable: //p' "$WORK/coldp.err" | head -n 1)
+        _coldp_cmd_proot=$(sed -n 's/^proot executable: //p' "$WORK/coldp.out" | head -n 1)
+        _proot_ver() {
+            if [ -x "$1" ]; then
+                "$1" --version 2>/dev/null | sed -n 's/.*| \([0-9][0-9.]*\)$/\1/p' | head -n 1
+            fi
+        }
+        if [ "$_coldp_rc" -eq 0 ] && grep -F -q 'nix (Nix)' "$WORK/coldp.out"; then
+            pass "cold proot nix version"
+        else
+            fail "cold proot nix version" "$(show_tails coldp "$WORK/coldp.err")"
+        fi
+        _coldp_git=
+        for d in "$coldp"/nix-store/.nix-portable/nix/store/*-git-minimal-*; do
+            if [ -d "$d" ]; then
+                _coldp_git=$d
+            fi
+        done
+        if [ -n "$_coldp_git" ]; then
+            pass "cold proot store installed gitMinimal"
+        else
+            fail "cold proot store installed gitMinimal"
+        fi
+        if [ -x "$_coldp_store_proot" ]; then
+            pass "cold proot store unpacked its proot"
+        else
+            fail "cold proot store unpacked its proot"
+        fi
+        # Same selection as prefer_newer_proot: ties keep the earlier candidate.
+        # Setup cannot see the store copy. The command can, and takes it only
+        # when that copy is strictly newer than the host proot.
+        _coldp_expect_init=$_coldp_forced
+        _coldp_init_best=$(_proot_ver "$_coldp_forced")
+        if [ -n "$_coldp_path_proot" ] && [ -x "$_coldp_path_proot" ]; then
+            _coldp_path_ver=$(_proot_ver "$_coldp_path_proot")
+            _coldp_higher=$(printf '%s\n%s\n' "$_coldp_init_best" "$_coldp_path_ver" | sort -V | tail -n 1)
+            if [ "$_coldp_higher" = "$_coldp_path_ver" ] && [ "$_coldp_path_ver" != "$_coldp_init_best" ]; then
+                _coldp_expect_init=$_coldp_path_proot
+                _coldp_init_best=$_coldp_path_ver
+            fi
+        fi
+        _coldp_expect_cmd=$_coldp_expect_init
+        _coldp_store_ver=$(_proot_ver "$_coldp_store_proot")
+        _coldp_higher=$(printf '%s\n%s\n' "$_coldp_init_best" "$_coldp_store_ver" | sort -V | tail -n 1)
+        if [ "$_coldp_higher" = "$_coldp_store_ver" ] && [ "$_coldp_store_ver" != "$_coldp_init_best" ]; then
+            _coldp_expect_cmd=$_coldp_store_proot
+        fi
+        if [ "$_coldp_init_proot" = "$_coldp_expect_init" ]; then
+            pass "cold proot setup uses host proot"
+        else
+            fail "cold proot setup uses host proot" "expected [${_coldp_expect_init}]
+init [${_coldp_init_proot}]
+$(show_tails coldp "$WORK/coldp.err")"
+        fi
+        if [ "$_coldp_cmd_proot" = "$_coldp_expect_cmd" ]; then
+            pass "cold proot command uses newest proot"
+        else
+            fail "cold proot command uses newest proot" "expected [${_coldp_expect_cmd}]
+command [${_coldp_cmd_proot}]"
+        fi
+        chmod -R u+w "$coldp" 2>/dev/null || true
+        rm -rf "$coldp"
     fi
 
     printf 'RUN host nix\n'

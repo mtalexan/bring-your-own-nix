@@ -80,13 +80,13 @@
 #   Each of these requires a properly configured flake.nix that defines the environment(s).
 # 
 #   As a shebang of a python script (assuming the flake.nix has python3), using the default devShell:
-#     #!/usr/bin/env -S sh -c '"$(dirname "$0")"/tools/nix-trampoline" "$(dirname "$0")/flake_dir" "" python3 "$0" "$@"'
+#     #!/usr/bin/env -S sh -c 'd=$(dirname "$0");"$d"/tools/nix-bang "$d"/flake_dir "" python3 "$0" "$@"'
 # 
 #   As a shebang of a ruby script using a custom devShell:
-#     #!/usr/bin/env -S sh -c '"$(dirname "$0")"/tools/nix-trampoline" "$(dirname "$0")/flake_dir" "myRubyShell" ruby "$0" "$@"'
+#     #!/usr/bin/env -S sh -c 'd=$(dirname "$0");"$d"/tools/nix-bang "$d"/flake_dir rubyDev ruby "$0" "$@"'
 # 
 #   As a standalone call, using the flake from the current directory to run a podman command:
-#     ./tools/nix-trampoline . "isolatedPodmanShell" podman "${podman_args[@]}"
+#     ./tools/nix-bang . "isolatedPodmanShell" podman "${podman_args[@]}"
 
 SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
 

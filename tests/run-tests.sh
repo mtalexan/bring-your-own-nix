@@ -13,12 +13,12 @@ SOURCE=$(CDPATH= cd "$(dirname "$0")" && pwd)
 BYO_DIR=$(CDPATH= cd "$SOURCE/.." && pwd)
 BYO=$BYO_DIR/byo-nix
 ENTER=$BYO_DIR/nix-flake-enter
-TRAMP=$BYO_DIR/nix-shebang-trampoline
+BANG=$BYO_DIR/nix-bang
 
 # Nix treats a flake inside a Git work tree as a Git input. It then ignores
 # untracked files, and the Git shipped with nix-portable cannot read this
 # checkout's index. Stage the suite outside the work tree. Shebangs look for
-# nix-shebang-trampoline two directories above the nested scripts.
+# nix-bang two directories above the nested scripts.
 STAGE=$(mktemp -d /tmp/byo-nix-stage.XXXXXX)
 cleanup_stage() {
     rm -rf "$STAGE"
@@ -29,10 +29,10 @@ cp -a "$SOURCE/." "$STAGE/tests/"
 rm -rf "$STAGE/tests/tmp"
 ln -s "$BYO" "$STAGE/byo-nix"
 ln -s "$ENTER" "$STAGE/nix-flake-enter"
-ln -s "$TRAMP" "$STAGE/nix-shebang-trampoline"
+ln -s "$BANG" "$STAGE/nix-bang"
 ROOT=$STAGE/tests
 
-export ROOT BYO_DIR BYO ENTER TRAMP
+export ROOT BYO_DIR BYO ENTER BANG
 OLD_PATH=$PATH
 export OLD_PATH
 
