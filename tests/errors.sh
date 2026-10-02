@@ -34,8 +34,8 @@ errors_and_stack() {
     run_enter
     rc=$?
     text=$(captured)
-    assert_rc "nix-flake-enter too few args" "$rc" 1
-    assert_contains "nix-flake-enter usage" "$text" "Too few arguments"
+    assert_rc "nix-devshell-enter too few args" "$rc" 1
+    assert_contains "nix-devshell-enter usage" "$text" "Too few arguments"
 
     run_enter "$WORK/no-such-flake" "" true
     rc=$?
@@ -83,21 +83,29 @@ EOF
     run_tramp() {
         "$BANG" "$@" >"$BYO_TEST_STDOUT" 2>"$BYO_TEST_STDERR"
     }
-    export NIX_FLAKE_ENTER_WRAPPER=$WORK/missing-enter
+    export NIX_DEVSHELL_ENTER_WRAPPER=$WORK/missing-enter
     run_tramp "$ROOT" "" /bin/echo "$WORK/script"
     rc=$?
     text=$(captured)
-    assert_rc "missing NIX_FLAKE_ENTER_WRAPPER" "$rc" 1
-    assert_contains "missing enter wrapper message" "$text" "No such nix-flake-enter"
+    assert_rc "missing NIX_DEVSHELL_ENTER_WRAPPER" "$rc" 1
+    assert_contains "missing enter wrapper message" "$text" "No such nix-devshell-enter"
 
     printf '#!/bin/sh\nexit 0\n' > "$WORK/enter"
-    export NIX_FLAKE_ENTER_WRAPPER=$WORK/enter
+    export NIX_DEVSHELL_ENTER_WRAPPER=$WORK/enter
     run_tramp "$ROOT" "" /bin/echo "$WORK/script"
     rc=$?
     text=$(captured)
-    assert_rc "non-executable NIX_FLAKE_ENTER_WRAPPER" "$rc" 1
-    assert_contains "non-executable enter wrapper message" "$text" "Not executable nix-flake-enter"
+    assert_rc "non-executable NIX_DEVSHELL_ENTER_WRAPPER" "$rc" 1
+    assert_contains "non-executable enter wrapper message" "$text" "Not executable nix-devshell-enter"
 
+    unset NIX_DEVSHELL_ENTER_WRAPPER
+    export NIX_FLAKE_ENTER_WRAPPER=$WORK/missing-enter
+    run_tramp "$ROOT"
+    rc=$?
+    text=$(captured)
+    assert_rc "old wrapper variable is ignored" "$rc" 1
+    assert_contains "old wrapper variable still reaches usage" "$text" "Too few arguments"
+    assert_not_contains "old wrapper variable is not read" "$text" "No such nix"
     unset NIX_FLAKE_ENTER_WRAPPER
     run_tramp "$ROOT"
     rc=$?
@@ -129,11 +137,12 @@ EOF
 
     cat > "$WORK/enter-log.sh" << 'EOF'
 #!/bin/sh
+printf 'STACK<%s>\n' "${__NIX_SHEBANG_STACK-}" >> "${BYO_TEST_ENTER_LOG:?}"
 printf 'ARG<%s>\n' "$@" >> "${BYO_TEST_ENTER_LOG:?}"
 exit 0
 EOF
     chmod a+x "$WORK/enter-log.sh"
-    export NIX_FLAKE_ENTER_WRAPPER=$WORK/enter-log.sh
+    export NIX_DEVSHELL_ENTER_WRAPPER=$WORK/enter-log.sh
     export BYO_TEST_ENTER_LOG=$WORK/enter.log
 
     : > "$WORK/enter.log"
@@ -373,6 +382,139 @@ EOF
     else
         fail "test shebangs fit in proot" "$_long"
     fi
+
+    printf '#!/bin/sh\nexit 0\n' > "$WORK/wrapper"
+    chmod a+x "$WORK/wrapper"
+    export BYO_NIX_WRAPPER=$WORK/wrapper
+    run_enter() {
+        "$ENTER" "$@" >"$BYO_TEST_STDOUT" 2>"$BYO_TEST_STDERR"
+    }
+
+    mkdir -p "$WORK/only-classic"
+    printf '{ }\n' > "$WORK/only-classic/shell.nix"
+    run_tramp "$WORK/only-classic" "" /bin/echo "$WORK/script"
+    rc=$?
+    text=$(captured)
+    assert_rc "directory with only a nix file" "$rc" 1
+    assert_contains "directory with only a nix file message" "$text" "No 'flake.nix' in flake directory"
+    assert_contains "directory with only a nix file tells caller to pass the file" "$text" "Pass the .nix file explicitly."
+    run_enter "$WORK/only-classic" "" true
+    rc=$?
+    text=$(captured)
+    assert_rc "enter rejects directory with only a nix file" "$rc" 1
+    assert_contains "enter directory with only a nix file message" "$text" "Pass the .nix file explicitly."
+
+    mkdir -p "$WORK/foo.nix"
+    printf '%s\n' '{ outputs = _: {}; }' > "$WORK/foo.nix/flake.nix"
+    run_tramp "$WORK/foo.nix" "" /bin/echo "$WORK/script"
+    rc=$?
+    text=$(captured)
+    assert_rc "directory named .nix" "$rc" 1
+    assert_contains "directory named .nix message" "$text" "Invalid .nix file"
+    run_enter "$WORK/foo.nix" "" true
+    rc=$?
+    text=$(captured)
+    assert_rc "enter rejects directory named .nix" "$rc" 1
+    assert_contains "enter directory named .nix message" "$text" "Invalid .nix file"
+
+    mk_flake_dir "$WORK/both"
+    printf '{ }\n' > "$WORK/both/shell.nix"
+    printf '{ }\n' > "$WORK/both/default.nix"
+    printf '{ }\n' > "$WORK/both/dev.nix"
+    printf 'not nix\n' > "$WORK/both/notes.txt"
+    shell_nix=$(CDPATH= cd "$WORK/both" && pwd)/shell.nix
+    default_nix=$(CDPATH= cd "$WORK/both" && pwd)/default.nix
+    dev_nix=$(CDPATH= cd "$WORK/both" && pwd)/dev.nix
+    both_dir=$(CDPATH= cd "$WORK/both" && pwd)
+
+    : > "$WORK/enter.log"
+    unset __NIX_SHEBANG_STACK
+    unset NIX_SHEBANG_DEVSHELL_MERGE
+    run_tramp "$shell_nix" "" /bin/echo marker
+    rc=$?
+    enter_log=$(cat "$WORK/enter.log")
+    assert_rc "explicit shell.nix next to flake.nix" "$rc" 0
+    assert_contains "blank classic attribute is forwarded blank" "$enter_log" "ARG<>"
+    assert_contains "blank classic attribute records default" "$enter_log" "STACK<$shell_nix#default|"
+
+    : > "$WORK/enter.log"
+    unset __NIX_SHEBANG_STACK
+    run_tramp "$default_nix" "" /bin/echo marker
+    rc=$?
+    enter_log=$(cat "$WORK/enter.log")
+    assert_rc "explicit default.nix" "$rc" 0
+    assert_contains "default.nix records default" "$enter_log" "STACK<$default_nix#default|"
+
+    : > "$WORK/enter.log"
+    unset __NIX_SHEBANG_STACK
+    run_tramp "$dev_nix" cowsay /bin/echo marker
+    rc=$?
+    enter_log=$(cat "$WORK/enter.log")
+    assert_rc "named classic attribute" "$rc" 0
+    assert_contains "named classic attribute is forwarded" "$enter_log" "ARG<cowsay>"
+    assert_contains "named classic attribute records cowsay" "$enter_log" "STACK<$dev_nix#cowsay|"
+
+    run_tramp "$WORK/both/notes.txt" "" /bin/echo "$WORK/script"
+    rc=$?
+    text=$(captured)
+    assert_rc "non-nix file" "$rc" 1
+    assert_contains "non-nix file message" "$text" "Flake directory doesn't exist"
+
+    : > "$WORK/enter.log"
+    export NIX_SHEBANG_DEVSHELL_MERGE="$dev_nix"
+    export __NIX_SHEBANG_STACK="$dev_nix#cowsay|$dev_nix#default|"
+    run_tramp "$dev_nix" "" /bin/echo marker
+    if [ ! -s "$WORK/enter.log" ]; then
+        pass "bare nix file covers the unnamed derivation"
+    else
+        fail "bare nix file covers the unnamed derivation" "$(cat "$WORK/enter.log")"
+    fi
+
+    : > "$WORK/enter.log"
+    export __NIX_SHEBANG_STACK="$dev_nix#default|$dev_nix#cowsay|"
+    run_tramp "$dev_nix" cowsay /bin/echo marker
+    if [ ! -s "$WORK/enter.log" ]; then
+        pass "bare nix file covers a named attribute"
+    else
+        fail "bare nix file covers a named attribute" "$(cat "$WORK/enter.log")"
+    fi
+
+    : > "$WORK/enter.log"
+    export __NIX_SHEBANG_STACK="$both_dir#default|"
+    run_tramp "$dev_nix" "" /bin/echo marker
+    if [ -s "$WORK/enter.log" ]; then
+        pass "bare nix file does not cover the flake directory"
+    else
+        fail "bare nix file does not cover the flake directory"
+    fi
+
+    : > "$WORK/enter.log"
+    export NIX_SHEBANG_DEVSHELL_MERGE="$dev_nix#cowsay"
+    export __NIX_SHEBANG_STACK="$dev_nix#hello|"
+    run_tramp "$dev_nix" cowsay /bin/echo marker
+    if [ -s "$WORK/enter.log" ]; then
+        pass "named classic attribute does not cover another attribute"
+    else
+        fail "named classic attribute does not cover another attribute"
+    fi
+
+    : > "$WORK/enter.log"
+    export NIX_SHEBANG_DEVSHELL_MERGE="$both_dir|$dev_nix"
+    export __NIX_SHEBANG_STACK="$dev_nix#default|$both_dir#default|"
+    run_tramp "$both_dir" "" /bin/echo marker
+    if [ ! -s "$WORK/enter.log" ]; then
+        pass "one merge set mixes a flake directory and a nix file"
+    else
+        fail "one merge set mixes a flake directory and a nix file" "$(cat "$WORK/enter.log")"
+    fi
+
+    export NIX_SHEBANG_DEVSHELL_MERGE="$dev_nix#"
+    export __NIX_SHEBANG_STACK="$dev_nix#default|"
+    run_tramp "$dev_nix" "" /bin/echo marker
+    rc=$?
+    text=$(captured)
+    assert_rc "classic merge entry with empty name" "$rc" 1
+    assert_contains "classic merge entry with empty name message" "$text" "absolute_flake_path#devShell"
 
     reset_env
     system=$system

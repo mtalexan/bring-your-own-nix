@@ -12,7 +12,7 @@
 SOURCE=$(CDPATH= cd "$(dirname "$0")" && pwd)
 BYO_DIR=$(CDPATH= cd "$SOURCE/.." && pwd)
 BYO=$BYO_DIR/byo-nix
-ENTER=$BYO_DIR/nix-flake-enter
+ENTER=$BYO_DIR/nix-devshell-enter
 BANG=$BYO_DIR/nix-bang
 
 # Nix treats a flake inside a Git work tree as a Git input. It then ignores
@@ -21,14 +21,18 @@ BANG=$BYO_DIR/nix-bang
 # nix-bang two directories above the nested scripts.
 STAGE=$(mktemp -d /tmp/byo-nix-stage.XXXXXX)
 cleanup_stage() {
-    rm -rf "$STAGE"
+    # Nix store objects are mode 444, and rm -rf stops on them.
+    if [ -d "$STAGE" ]; then
+        chmod -R u+w "$STAGE" 2>/dev/null || true
+        rm -rf "$STAGE"
+    fi
 }
 trap cleanup_stage EXIT INT TERM
 mkdir -p "$STAGE/tests"
 cp -a "$SOURCE/." "$STAGE/tests/"
 rm -rf "$STAGE/tests/tmp"
 ln -s "$BYO" "$STAGE/byo-nix"
-ln -s "$ENTER" "$STAGE/nix-flake-enter"
+ln -s "$ENTER" "$STAGE/nix-devshell-enter"
 ln -s "$BANG" "$STAGE/nix-bang"
 ROOT=$STAGE/tests
 
