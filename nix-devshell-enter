@@ -31,9 +31,9 @@
 #
 #-------------------------------------------------------------------------------
 #
-# This script is used for entering a devShell of a Nix flake to run an arbitrary and
-# possibly interactive command within it. Nix may be nix-portable and may need to be
-# automatically bootstrapped.
+# This script enters a Nix devShell and runs a command inside it. The devShell comes
+# from a flake directory or from a classic *.nix file. Nix may be nix-portable and may
+# need to be bootstrapped.
 # 
 # WARNING: devShell requires nscd or nsncd running on the host!
 #          glibc automatically delegates to it when present, which is required if any
@@ -43,12 +43,29 @@
 #          require additions or updates.
 # 
 # Args:
-#   1: Path to folder containing a flake.nix
-#   2: Name of the devShell in the flake.nix to enter. If blank, the default is used. 
-#      This will always be a 'devShells.{system-type}.{name}' in the flake.nix, where system-type is auto-detected.
-#      The deprecated 'devShell' or 'devShell.{system-type}' in the flake.nix for the default is not supported.
-#   3*: (optional) Commands to run within the devShell. e.g. 'ruby' '$0' '$@'.
-#       Uses the nix default of an interactive bash shell if not specified.
+#   1: A flake directory, or a classic *.nix file.
+#      A path whose name ends in .nix is a classic file and must be a regular file.
+#      shell.nix is the conventional name. Any other *.nix name is also accepted.
+#      A directory whose name ends in .nix is rejected.
+#      Any other path is a flake directory and must contain flake.nix. A directory that
+#      only has a *.nix file is an error; pass that file instead. There is no fallback
+#      from a missing shell.nix to default.nix.
+#   2: DevShell name or classic attribute. Blank selects the flake default devShell,
+#      devShells.{system}.default, or the classic file's own derivation. A classic
+#      attribute is not a devShells.{system}.{name} output. The file, or that attribute,
+#      must evaluate to a pkgs.mkShell.
+#   3*: (optional) Command to run within the devShell, then its arguments.
+#       Uses an interactive bash shell if not specified.
+#
+# WARNING: nix-portable ships a nixpkgs channel pinned when that nix-portable was built,
+#          which can be as much as two years old. An unpinned nixpkgs in a classic *.nix
+#          file uses that channel. niv and npins can pin a newer nixpkgs for the rest of
+#          the derivation, but the niv or npins tool itself still comes from that channel.
+# WARNING: The classic pre-build only asks Nix whether the inputDerivation is already in
+#          the store. If the evaluated inputs are unchanged, including when an niv or npins
+#          lock was not updated, nothing is rebuilt.
+# WARNING: A native Nix install (BYO_NIX) must have the nix-command experimental feature
+#          enabled. The flakes feature is required only when the target is a flake directory.
 # 
 # Environment:# 
 #   BYO_NIX_WRAPPER=(script dir)/byo-nix
@@ -58,7 +75,9 @@
 #   BYO_NIX=(unset)
 #     If set, it should be the path to a nix binary to use instead of the nix-portable binary.
 #     Expected to be a system-installed nix, which handles store locking on its own, so
-#     external flocking is not done when this is set.
+#     external flocking is not done when this is set. The install must have nix-command
+#     enabled. flakes is required only for a flake directory. A classic *.nix file does
+#     not require flakes.
 #   BYO_NIX_PORTABLE_CACHE_ROOT=(script dir)
 #     The BYO_NIX_PORTABLE_STORE path is relative to the location specified here.
 #     The default is the folder this script is in.
@@ -77,16 +96,14 @@
 #     /var/run/nscd/socket. Set this only to exercise the missing-socket error.
 # 
 # Examples:
-#   Each of these requires a properly configured flake.nix that defines the environment(s).
-# 
-#   As a shebang of a python script (assuming the flake.nix has python3), using the default devShell:
-#     #!/usr/bin/env -S sh -c '"$(dirname "$0")"/tools/nix-trampoline" "$(dirname "$0")/flake_dir" "" python3 "$0" "$@"'
-# 
-#   As a shebang of a ruby script using a custom devShell:
-#     #!/usr/bin/env -S sh -c '"$(dirname "$0")"/tools/nix-trampoline" "$(dirname "$0")/flake_dir" "myRubyShell" ruby "$0" "$@"'
-# 
-#   As a standalone call, using the flake from the current directory to run a podman command:
-#     ./tools/nix-trampoline . "isolatedPodmanShell" podman "${podman_args[@]}"
+#   Flake directory, default devShell:
+#     ./tools/nix-devshell-enter ./flake_dir "" python3 ./myscript.py arg1
+#   Flake directory, named devShell:
+#     ./tools/nix-devshell-enter ./flake_dir myRubyShell ruby ./script.rb
+#   Classic shell.nix, the file's own derivation:
+#     ./tools/nix-devshell-enter ./shell.nix "" python3 ./myscript.py arg1
+#   Classic file, one attribute:
+#     ./tools/nix-devshell-enter ./dev.nix cowsay cowsay hello
 
 SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
 
@@ -158,35 +175,57 @@ _nix_system="$(detect_system)"
 #-------------------------------
 
 # There must be at least 1 command, otherwise we aren't running anything in the devShell
-[ $# -ge 3 ] || die "Too few arguments. USAGE: $0 <flake_dir> <devShell_name> <commands...>"
+[ $# -ge 3 ] || die "Too few arguments. USAGE: $0 <flake_dir_or_nix_file> <devShell_or_attr> <commands...>"
 
-_flake_dir="$1"
+_target_arg="$1"
 _devshell_name="$2"
 shift 2
 # command args are all in $@ now
 
-[ -d "$_flake_dir" ] || die "Flake directory doesn't exist: ${_flake_dir}"
-[ -f "${_flake_dir}/flake.nix" ] || die "No 'flake.nix' in flake directory: ${_flake_dir}"
-# convert to absolute path w/o symlink resolution, and drop a trailing slash so
-# /path/flake and /path/flake/ are the same flake. "/" itself is left as "/".
-_flake_dir=$(cd "$_flake_dir" && pwd)
-_flake_dir=$(printf '%s\n' "$_flake_dir" | sed -E -e 's@/+$@@')
-[ -n "$_flake_dir" ] || _flake_dir=/
+# A trailing slash does not change the kind of path. "/" itself stays "/".
+_target_arg=$(printf '%s\n' "$_target_arg" | sed -E -e 's@/+$@@')
+[ -n "$_target_arg" ] || _target_arg=/
 
-# Get the object within the flake.nix for the specific devShell. Only support the modern 
-# 'devShells.*.default' and not the deprecated 'devShell' for the default.
-# Also construct the flake name we need to pass to the 'nix develop' commands.
-if [ -z "$_devshell_name" ]; then
-    # used in nix build calls
-    _nix_devshell_attr="${_flake_dir}#devShells.${_nix_system}.default"
-    # used in nix develop calls
-    _nix_develop_arg="${_flake_dir}"
-else
-    # used in nix build calls
-    _nix_devshell_attr="${_flake_dir}#devShells.${_nix_system}.${_devshell_name}"
-    # used in nix develop calls
-    _nix_develop_arg="${_flake_dir}#${_devshell_name}"
-fi
+_target_kind=
+_target_path=
+_nix_devshell_attr=
+_classic_input=
+case "$_target_arg" in
+    *.nix)
+        # Name is checked before the file type so a directory named *.nix cannot be a flake.
+        _target_kind=classic
+        [ -f "$_target_arg" ] || die "Invalid .nix file: ${_target_arg}"
+        _target_parent=$(CDPATH= cd "$(dirname "$_target_arg")" && pwd) || die "Invalid .nix file: ${_target_arg}"
+        _target_parent=$(printf '%s\n' "$_target_parent" | sed -E -e 's@/+$@@')
+        [ -n "$_target_parent" ] || _target_parent=/
+        if [ "$_target_parent" = / ]; then
+            _target_path="/$(basename "$_target_arg")"
+        else
+            _target_path="${_target_parent}/$(basename "$_target_arg")"
+        fi
+        if [ -z "$_devshell_name" ]; then
+            _classic_input=inputDerivation
+        else
+            _classic_input="${_devshell_name}.inputDerivation"
+        fi
+        _nix_devshell_attr="-f ${_target_path} ${_classic_input}"
+        ;;
+    *)
+        _target_kind=flake
+        [ -d "$_target_arg" ] || die "Flake directory doesn't exist: ${_target_arg}"
+        [ -f "${_target_arg}/flake.nix" ] || die "No 'flake.nix' in flake directory: ${_target_arg}. Pass the .nix file explicitly."
+        # Absolute path without symlink resolution. A trailing slash was already removed.
+        _target_path=$(CDPATH= cd "$_target_arg" && pwd)
+        _target_path=$(printf '%s\n' "$_target_path" | sed -E -e 's@/+$@@')
+        [ -n "$_target_path" ] || _target_path=/
+        # Only the modern devShells.<system>.<name> output. Blank is devShells.<system>.default.
+        if [ -z "$_devshell_name" ]; then
+            _nix_devshell_attr="${_target_path}#devShells.${_nix_system}.default"
+        else
+            _nix_devshell_attr="${_target_path}#devShells.${_nix_system}.${_devshell_name}"
+        fi
+        ;;
+esac
 
 #-------------------------------
 # Check for nscd/nsncd socket
@@ -256,11 +295,20 @@ if [ -z "$BYO_NIX" ] && [ -z "$BYO_NO_LOCK" ]; then
     # Empty output from a successful dry-run means the devShell is already in the store.
     # byo-nix would otherwise wait on the store lock this script already holds.
     # Make sure we specify we already hold the write lock in case the store still has to be initialized too.
-    _dry_run_output=$(BYO_NIX_PORTABLE_STORE_LOCKED=1 "$BYO_NIX_WRAPPER" build --dry-run "${_nix_devshell_attr}" 2>&1) || {
-        exec 9>&-
-        die "Getting store status for flake devShell from: '$BYO_NIX_WRAPPER' build --dry-run  '${_nix_devshell_attr}'" "
+    # Classic files use nix build -f, which does not require the flakes feature.
+    if [ "$_target_kind" = classic ]; then
+        _dry_run_output=$(BYO_NIX_PORTABLE_STORE_LOCKED=1 "$BYO_NIX_WRAPPER" build --dry-run -f "$_target_path" "$_classic_input" 2>&1) || {
+            exec 9>&-
+            die "Getting store status for classic devShell from: '$BYO_NIX_WRAPPER' build --dry-run -f '${_target_path}' '${_classic_input}'. The target must be a pkgs.mkShell." "
 $_dry_run_output"
-    }
+        }
+    else
+        _dry_run_output=$(BYO_NIX_PORTABLE_STORE_LOCKED=1 "$BYO_NIX_WRAPPER" build --dry-run "${_nix_devshell_attr}" 2>&1) || {
+            exec 9>&-
+            die "Getting store status for flake devShell from: '$BYO_NIX_WRAPPER' build --dry-run  '${_nix_devshell_attr}'" "
+$_dry_run_output"
+        }
+    fi
     
     _devshell_store_update=
     # don't really have a better way to query the status, there is no machine readable way
@@ -282,10 +330,18 @@ $_dry_run_output"
         echo >&2 "Pre-building devShell for: ${_nix_devshell_attr}"
         # Use --no-link because we're just building it into the store.
         # Make sure we specify we already hold the write lock in case the store still has to be initialized too.
-        BYO_NIX_PORTABLE_STORE_LOCKED=1 "$BYO_NIX_WRAPPER" build --no-link "${_nix_devshell_attr}" 1>&2 || {
-            exec 9>&-
-            die "Pre-building the devShell with: $BYO_NIX_WRAPPER build --no-link '${_nix_devshell_attr}'"
-        }
+        # inputDerivation realizes the mkShell inputs. Building the mkShell itself is not a real build.
+        if [ "$_target_kind" = classic ]; then
+            BYO_NIX_PORTABLE_STORE_LOCKED=1 "$BYO_NIX_WRAPPER" build --no-link -f "$_target_path" "$_classic_input" 1>&2 || {
+                exec 9>&-
+                die "Pre-building the devShell with: $BYO_NIX_WRAPPER build --no-link -f '${_target_path}' '${_classic_input}'. The target must be a pkgs.mkShell."
+            }
+        else
+            BYO_NIX_PORTABLE_STORE_LOCKED=1 "$BYO_NIX_WRAPPER" build --no-link "${_nix_devshell_attr}" 1>&2 || {
+                exec 9>&-
+                die "Pre-building the devShell with: $BYO_NIX_WRAPPER build --no-link '${_nix_devshell_attr}'"
+            }
+        fi
     fi
 
     # Release the write lock before entering the devShell. The build is in the store.
@@ -297,14 +353,37 @@ fi
 #-------------------------------
 
 # we previously shifted the args so only the command and args are in $@
-if [ $# -ge 1 ]; then
-    _command="$1"
-    shift
-    # Replace our current process with the invocation of the devShell.
-    # We shifted all our args so $@ is the args (if any) to the command now
-    exec "$BYO_NIX_WRAPPER" develop "${_nix_develop_arg}" --command "$_command" "$@"
+# Blank is not passed as the attribute "default". That name is only a stack placeholder.
+if [ "$_target_kind" = classic ]; then
+    if [ $# -ge 1 ]; then
+        _command="$1"
+        shift
+        if [ -n "$_devshell_name" ]; then
+            exec "$BYO_NIX_WRAPPER" develop -f "$_target_path" "$_devshell_name" --command "$_command" "$@"
+        else
+            exec "$BYO_NIX_WRAPPER" develop -f "$_target_path" --command "$_command" "$@"
+        fi
+    elif [ -n "$_devshell_name" ]; then
+        exec "$BYO_NIX_WRAPPER" develop -f "$_target_path" "$_devshell_name"
+    else
+        exec "$BYO_NIX_WRAPPER" develop -f "$_target_path"
+    fi
+elif [ -z "$_devshell_name" ]; then
+    _nix_develop_arg="$_target_path"
+    if [ $# -ge 1 ]; then
+        _command="$1"
+        shift
+        exec "$BYO_NIX_WRAPPER" develop "${_nix_develop_arg}" --command "$_command" "$@"
+    else
+        exec "$BYO_NIX_WRAPPER" develop "${_nix_develop_arg}"
+    fi
 else
-    # Replace our current process with the invocation of the devShell.
-    # Defaults to an interactive bash shell in the devShell
-    exec "$BYO_NIX_WRAPPER" develop "${_nix_develop_arg}"
+    _nix_develop_arg="${_target_path}#${_devshell_name}"
+    if [ $# -ge 1 ]; then
+        _command="$1"
+        shift
+        exec "$BYO_NIX_WRAPPER" develop "${_nix_develop_arg}" --command "$_command" "$@"
+    else
+        exec "$BYO_NIX_WRAPPER" develop "${_nix_develop_arg}"
+    fi
 fi

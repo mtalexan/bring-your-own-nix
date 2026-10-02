@@ -233,6 +233,54 @@ functional() {
     assert_rc "pre-build failure" "$rc" 1
     assert_contains "pre-build failure message" "$text" "Pre-building the devShell"
 
+    classic_file=$WORK/shell.nix
+    printf '{ }\n' > "$classic_file"
+    classic_abs=$(CDPATH= cd "$(dirname "$classic_file")" && pwd)/$(basename "$classic_file")
+    classic_dir=$(dirname "$classic_abs")
+
+    : > "$BYO_TEST_LOG"
+    export BYO_TEST_DRY=empty
+    run_enter_captured "$classic_file" "" hello extra-arg
+    rc=$?
+    log=$(cat "$BYO_TEST_LOG")
+    assert_rc "classic blank dry-run enters" "$rc" 0
+    assert_contains "classic blank dry-run attr" "$log" "build --dry-run -f $classic_abs inputDerivation"
+    assert_contains "classic blank develop" "$log" "develop -f $classic_abs --command hello extra-arg"
+    assert_contains "classic blank uses -f" "$log" "-f"
+    assert_not_contains "classic blank is not a flake installable" "$log" "#devShells."
+    assert_not_contains "classic blank does not develop the directory" "$log" "develop $classic_dir "
+    assert_not_contains "classic blank does not build the directory" "$log" "build --dry-run $classic_dir#"
+
+    : > "$BYO_TEST_LOG"
+    export BYO_TEST_DRY=built
+    run_enter_captured "$classic_file" cowsay cowsay hello
+    rc=$?
+    log=$(cat "$BYO_TEST_LOG")
+    assert_rc "classic named dry-run enters" "$rc" 0
+    assert_contains "classic named dry-run attr" "$log" "build --dry-run -f $classic_abs cowsay.inputDerivation"
+    assert_contains "classic named develop" "$log" "develop -f $classic_abs cowsay --command cowsay hello"
+    assert_contains "classic named pre-builds" "$log" "build --no-link -f $classic_abs cowsay.inputDerivation"
+    assert_not_contains "classic named is not a flake installable" "$log" "#devShells."
+
+    : > "$BYO_TEST_LOG"
+    export BYO_TEST_DRY=fail
+    run_enter_captured "$classic_file" "" hello
+    rc=$?
+    text=$(captured)
+    assert_rc "classic dry-run failure" "$rc" 1
+    assert_contains "classic dry-run failure requires mkShell" "$text" "pkgs.mkShell"
+
+    : > "$BYO_TEST_LOG"
+    export BYO_NIX=/bin/true
+    export BYO_TEST_DRY=built
+    run_enter_captured "$classic_file" "" hello
+    rc=$?
+    log=$(cat "$BYO_TEST_LOG")
+    assert_rc "classic BYO_NIX skips pre-build status" "$rc" 0
+    assert_not_contains "classic BYO_NIX skips dry-run" "$log" "--dry-run"
+    assert_contains "classic BYO_NIX still develops" "$log" "develop -f $classic_abs --command hello"
+    unset BYO_NIX
+
     : > "$BYO_TEST_LOG"
     export BYO_NIX=/bin/true
     export BYO_TEST_DRY=built
@@ -412,9 +460,18 @@ $(show_tails warm-cowsay "$WORK/warm-cowsay.err")"
         fail "nimscript" "$(show_tails nim "$WORK/nim.err")"
     fi
 
+    printf 'RUN classic nix-portable shell\n'
+    "$ENTER" "$ROOT/classic/shell.nix" "" hello >"$WORK/classic.out" 2>"$WORK/classic.err"
+    rc=$?
+    if [ "$rc" -eq 0 ] && grep -F -q 'Hello, world!' "$WORK/classic.out"; then
+        pass "classic nix-portable hello"
+    else
+        fail "classic nix-portable hello" "$(show_tails classic "$WORK/classic.err")"
+    fi
+
     printf 'RUN nested shebang stack\n'
     unset BYO_NIX_WRAPPER
-    export NIX_FLAKE_ENTER_WRAPPER=$ROOT/enter-wrapper.sh
+    export NIX_DEVSHELL_ENTER_WRAPPER=$ROOT/enter-wrapper.sh
     export BYO_TEST_REAL_ENTER=$ENTER
     export BYO_TEST_ENTER_LOG=$WORK/enter.log
 
@@ -484,10 +541,21 @@ $(cat "$BYO_TEST_ENTER_LOG")"
         fail "host nix present"
     else
         pass "host nix present"
-        export BYO_NIX=$host_nix
+        # --store is required. A multi-user client talks to the system daemon, which
+        # ignores NIX_STORE_DIR and would still write /nix/store.
+        cat > "$WORK/nix-store-wrapper.sh" << 'EOF'
+#!/bin/sh
+exec "$BYO_TEST_REAL_NIX" --store "local?root=${BYO_TEST_NIX_ROOT}" "$@"
+EOF
+        chmod a+x "$WORK/nix-store-wrapper.sh"
+        export BYO_TEST_REAL_NIX=$host_nix
+        export BYO_TEST_NIX_ROOT=$WORK/nix-root
+        export BYO_NIX=$WORK/nix-store-wrapper.sh
         export BYO_NIX_PORTABLE_CACHE_ROOT=$WORK/host-cache
         export BYO_NIX_PORTABLE=nix-portable
         export BYO_NIX_PORTABLE_STORE=nix-store
+        wrapper_text=$(cat "$WORK/nix-store-wrapper.sh")
+        assert_contains "isolating wrapper passes --store" "$wrapper_text" '--store "local?root=${BYO_TEST_NIX_ROOT}"'
         "$BYO" run 'nixpkgs#hello' >"$WORK/host-hello.out" 2>"$WORK/host-hello.err"
         rc=$?
         if [ "$rc" -eq 0 ] && grep -F -q 'Hello, world!' "$WORK/host-hello.out"; then
@@ -515,6 +583,49 @@ $(cat "$BYO_TEST_ENTER_LOG")"
             fail "host nix creates no portable store"
         else
             pass "host nix creates no portable store"
+        fi
+        if find "$WORK/nix-root/nix/store" -mindepth 1 -print -quit 2>/dev/null | grep -q .; then
+            pass "private store received builds"
+        else
+            fail "private store received builds" "$WORK/nix-root"
+        fi
+
+        printf 'RUN classic file without flakes\n'
+        cat > "$WORK/nix-no-flakes.sh" << 'EOF'
+#!/bin/sh
+exec "$BYO_TEST_REAL_NIX" --store "local?root=${BYO_TEST_NIX_ROOT}" --option experimental-features nix-command --option extra-experimental-features '' "$@"
+EOF
+        chmod a+x "$WORK/nix-no-flakes.sh"
+        noflakes_text=$(cat "$WORK/nix-no-flakes.sh")
+        assert_contains "flakes-disabled wrapper passes --store" "$noflakes_text" '--store "local?root=${BYO_TEST_NIX_ROOT}"'
+        export BYO_NIX=$WORK/nix-no-flakes.sh
+        unset NIX_PATH
+        "$ENTER" "$ROOT/classic/pinned.nix" "" hello >"$WORK/noflakes-classic.out" 2>"$WORK/noflakes-classic.err"
+        rc=$?
+        if [ "$rc" -eq 0 ] && grep -F -q 'Hello, world!' "$WORK/noflakes-classic.out"; then
+            pass "classic file without flakes"
+        else
+            fail "classic file without flakes" "$(show_tails noflakes-classic "$WORK/noflakes-classic.err")"
+        fi
+        "$BYO" config show experimental-features >"$WORK/noflakes-features.out" 2>"$WORK/noflakes-features.err"
+        features=$(cat "$WORK/noflakes-features.out")
+        if printf '%s\n' "$features" | grep -F -q flakes; then
+            fail "flakes feature is unset" "$features"
+        else
+            pass "flakes feature is unset"
+        fi
+        "$ENTER" "$ROOT" "" hello >"$WORK/noflakes-flake.out" 2>"$WORK/noflakes-flake.err"
+        rc=$?
+        noflakes_flake=$(cat "$WORK/noflakes-flake.out" "$WORK/noflakes-flake.err")
+        if [ "$rc" -ne 0 ] && printf '%s\n' "$noflakes_flake" | grep -F -q flakes; then
+            pass "flake directory fails without flakes"
+        elif [ "$rc" -eq 0 ]; then
+            # Some Nix builds still accept a flake directory after the flakes
+            # feature is removed from the setting. The unset feature list is
+            # the control that the classic enter did not turn flakes on.
+            pass "flake directory is accepted without the flakes feature"
+        else
+            fail "flake directory fails without flakes" "$noflakes_flake"
         fi
     fi
 

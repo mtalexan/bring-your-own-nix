@@ -31,121 +31,84 @@
 #
 #-------------------------------------------------------------------------------
 #
-# This script is for use in a shebang that wants to run the script contianing it
-# using an interpeter that's part of a nix flake devShell.
-# Supports calling other specilized shebang scripts from a shebang script as well.
-# 
+# This script is for use in a shebang that wants to run the script containing it
+# using an interpreter from a Nix devShell. The devShell is a flake directory or a
+# classic *.nix file. Nested shebang scripts can call each other.
+#
 # WARNING: devShell requires nscd or nsncd running on the host!
 #          glibc automatically delegates to it when present, which is required if any
 #          nsswitch.conf is ever used, or if almost any host tools need to be run.
+# WARNING: A classic *.nix file, or the selected attribute, must evaluate to a pkgs.mkShell.
+#          A package expression such as a typical default.nix built with mkDerivation is not supported.
+# WARNING: nix-portable ships a nixpkgs channel pinned when that nix-portable was built, which
+#          can be as much as two years old. An unpinned nixpkgs in a classic *.nix file uses that
+#          channel. niv and npins can pin a newer nixpkgs for the rest of the derivation, but the
+#          niv or npins tool itself still comes from that channel.
+# WARNING: The classic pre-build only asks Nix whether the inputDerivation is already in the store.
+#          If the evaluated inputs are unchanged, including when an niv or npins lock was not
+#          updated, nothing is rebuilt.
 #
 # Args:
-#   1: Path to folder containing a flake.nix. This will be converted to an absolute path
-#      without any symlink resolution if not already an absolute path.
-#      WARNING: flake matching is text based on this absolute path, so referencing the same
-#               flake via a different symlink is treated as a different flake.
-#   2: Name of the devShell in the flake.nix to enter. If blank, the default is used. 
-#      This will always be a 'devShells.{system-type}.{name}' in the flake.nix, where system-type is auto-detected.
-#      The deprecated 'devShell'/'devShell.{system-type}' in the flake.nix for the default is not supported.
+#   1: A flake directory, or a classic *.nix file.
+#      A path whose name ends in .nix is always a classic file and must be a regular file.
+#      shell.nix is the conventional name. Any other *.nix name is also accepted.
+#      A directory whose name ends in .nix is rejected. Any other path must be a directory
+#      containing flake.nix. There is no fallback from a directory, or from one filename
+#      to another. Pass the *.nix file explicitly.
+#      The stack id uses the absolute path without resolving symlinks. The same project
+#      reached through a different symlink is a different devShell.
+#   2: Flake devShell name, or a classic attribute path. Blank becomes `default` in
+#      __NIX_SHEBANG_STACK for both. For a classic file, `default` is only that placeholder:
+#      it is not passed to nix develop, and it means the file's own derivation.
 #   3: Interpreter to use for the file
 #   4: Always "$0" from the shebang call
 #   5*: Always "$@" from the shebang call
-# 
+#
 # Environment:
-#   See the environment variables for nix-flake-enter and byo-nix, which will be passed thru as well.
-# 
+#   See the environment variables for nix-devshell-enter and byo-nix, which are passed through.
+#
 #   NIX_SHEBANG_DEVSHELL_MERGE=(unset)
-#     A comma-separated list of pipe-separated flake+devShells. Each flake+devShell is
-#     ${flake_abs_path}#${devShell}, the same form stored in __NIX_SHEBANG_STACK.
-#     ${flake_abs_path} is the absolute path of the directory containing flake.nix, not the
-#     path to the flake.nix file (e.g. /home/me/flake_dir#default, not
-#     /home/me/flake_dir/flake.nix#default). The devShell
-#     name is the flake output name only, without the devShells.<system>. prefix. The default
-#     devShell is `default`. Blank comma-separated values are ignored, which allows unconditionally
-#     extending a previously undefined value with a comma
-#     (e.g. NIX_SHEBANG_DEVSHELL_MERGE+=",$(pwd)/my_flake_dir#default" is always valid), while
-#     pipe-separated values cannot be blank
-#     (e.g. NIX_SHEBANG_DEVSHELL_MERGE+="$(pwd)/my_flake_dir#default|" usually isn't valid).
-#     A bare flake directory, with no #devShell, is shorthand for every devShell in that flake.
-#     Each comma-separated set declares that those flake+devShells are independent and
-#     may be overlaid in any order. See DevShell Nesting.
-#     Flake paths must be absolute and must not have symlinks resolved.
-#     A trailing slash on a flake directory is ignored. 
-# 
-#   NIX_FLAKE_ENTER_WRAPPER=(script dir)/nix-flake-enter
+#     Lists devShells that are independent of each other. Scripts that use this trampoline
+#     often call each other. Re-entering a devShell that is already active is slow, so the
+#     trampoline tracks the devShells it has entered. When another devShell has been entered
+#     since then, it cannot tell whether that one changed something the earlier one set, so
+#     by default it enters again. Within one set, listed devShells are treated as
+#     non-conflicting, so an earlier one still counts as active when only members of that
+#     set have been entered after it.
+#     Comma-separated sets. Each set is a pipe-separated list of entries. Blank comma entries
+#     are ignored, so appending ",..." is always safe. Blank pipe entries are an error. Sets
+#     are not combined with each other.
+#     Paths are absolute and must match the path given to the trampoline, without resolving
+#     symlinks. A trailing / is ignored.
+#     Flake: the directory containing flake.nix. /proj means every devShell in that flake.
+#     /proj#name means only that devShell, and /proj#default is the default devShell.
+#     Classic: the full path to the .nix file. /proj/shell.nix means every attribute of that
+#     file, including the file's own derivation when no attribute is given.
+#     /proj/shell.nix#name means only that attribute, and /proj/shell.nix#default is the
+#     file's derivation when no attribute was passed.
+#     /proj and /proj/shell.nix are different entries. A flake directory never covers a
+#     classic file in it.
+#     A flake directory whose name ends in .nix is not supported. Any path ending in .nix
+#     is treated as a classic file, so such a directory fails as an invalid .nix file.
+#
+#   NIX_DEVSHELL_ENTER_WRAPPER=(script dir)/nix-devshell-enter
 #     The path to the script that wraps the byo-nix calls for entering a devShell.
-#     There's no guarantee this will actually be called since we may determine no additional devShell entry
-#     is necessary.
-# 
+#     It is not called when the trampoline decides the devShell is already active.
+#
 #   __NIX_SHEBANG_STACK
-#     Reserved for internal use. A pipe-separated stack of ${flake_abs_path}#${devShell}
-#     entries already entered, where ${flake_abs_path} is the directory containing flake.nix.
-#     The devShell name omits the devShells.<system>. prefix, and
-#     the default devShell is `default`. The top of the stack is the front of the list.
-# 
-# DevShell Nesting:
-#   Calling a script using this script as a shebang from another script using this script as a
-#   shebang is a likely scenario. When this happens, the devShell used for each shebang may or
-#   may not be the same, and may or may not be from the the same flake. 
-#   devShells, regardless of flake, are always overlaid on top of the current environment, even when
-#   the current environemnt is another devShell. This allows an obvious optimization for when we
-#   don't need to enter a new devShell subshell, when the current environment already matches the
-#   one we want.
-#   There are two ways the current environment can meet what we request, either the most recent devShell
-#   is the same one now being requested, or someone has guaranteed that any intervening devShells that
-#   may have been overlaid on top of the previously applied one being requested do not affect the same
-#   things.
-#   The first case is trivial, if the devShell requested is already the exact one we're in, we don't
-#   need to do anything extra.
-#   The second case however requires someone with knowledge of the specific flakes to inform us about
-#   which can and can't affect each other. The NIX_SHEBANG_DEVSHELL_MERGE environment variable is how
-#   a caller, who usually also controls the flake(s) being entered, names the flake+devShells that
-#   are independent and can therefore be overlaid in any order without affecting one another.
-#   An entry of ${flake_abs_path}#${devShell} names one devShell. Listing one devShell from a flake
-#   does not cover the others. An entry of only ${flake_abs_path}, the directory containing flake.nix,
-#   is shorthand for every devShell in that flake.
-# 
-#   The NIX_SHEBANG_DEVSHELL_MERGE variable has a 2-part hierarchy. Commas separate independent sets.
-#   Pipes separate the entries inside one set. Two named devShells from the same flake are independent
-#   when both ${flake_abs_path}#${devShell} entries are in the same set, or when the bare flake directory
-#   is in that set.
-# 
-#   For example, when 'NIX_SHEBANG_DEVSHELL_MERGE=', this script skips re-entry only when the requested
-#   flake+devShell is already the top of the stack.
-#   If 'NIX_SHEBANG_DEVSHELL_MERGE=$(pwd)/flake_dir_a#default|$(pwd)/flake_dir_a#cowsay', a request for
-#   '$(pwd)/flake_dir_a#default' may be satisfied by an earlier stack entry of that same id when every
-#   entry above it is also in that set, including '$(pwd)/flake_dir_a#cowsay'. A different named devShell
-#   from flake_dir_a that is not listed still forces re-entry.
-#   'NIX_SHEBANG_DEVSHELL_MERGE=$(pwd)/flake_dir_a' is the shorthand for that same guarantee across
-#   every devShell in flake_dir_a. It does not cover devShells from any other flake.
-#   If 'NIX_SHEBANG_DEVSHELL_MERGE=$(pwd)/flake_dir_a#default,$(pwd)/flake_dir_b#default', the two
-#   entries are separate sets. A request for flake_dir_b#default stops at flake_dir_a#default, and the
-#   reverse is also true.
-#   If 'NIX_SHEBANG_DEVSHELL_MERGE=$(pwd)/flake_dir_a#default|$(pwd)/flake_dir_b#cowsay,$(pwd)/flake_dir_c#default',
-#   flake_dir_a#default and flake_dir_b#cowsay may overlay each other. flake_dir_c#default is a separate
-#   set. A request for flake_dir_a#default does not match flake_dir_b#cowsay, and it does not treat
-#   flake_dir_c#default as compatible.
-#   
-# 
+#     Reserved. Leave it unset when starting a command.
+#
 # Examples:
-#   Each of these requires a properly configured flake.nix that defines the environment(s).
-# 
-#   As a shebang of a python script (assuming the flake.nix has python3), using the default devShell:
-#     #!/usr/bin/env -S sh -c '"$(dirname "$0")"/tools/nix-trampoline" "$(dirname "$0")/flake_dir" "" python3 "$0" "$@"'
-# 
-#   As a shebang of a ruby script using a custom devShell:
-#     #!/usr/bin/env -S sh -c '"$(dirname "$0")"/tools/nix-trampoline" "$(dirname "$0")/flake_dir" "myRubyShell" ruby "$0" "$@"'
-# 
-#   As a standalone call, using the flake from the current directory to run a podman command:
-#     ./tools/nix-trampoline . "isolatedPodmanShell" podman "${podman_args[@]}"
-# 
-#   As a shebang for a shell script where every devShell in one flake is independent and may be
-#   overlaid in any order without conflict. The bare flake directory is that shorthand.
-#     #!/usr/bin/env -S sh -c 'NIX_SHEBANG_DEVSHELL_MERGE+=",$(pwd)/flake_dir" "$(dirname "$0")"/tools/nix-trampoline" "$(dirname "$0")/flake_dir" "" "bash" "$0" "$@"''
-# 
-#   As a shebang for a shell script where specific devShells in ./flake_a and ./flake_b are independent
-#   and may be overlaid in any order without conflict.
-#     #!/usr/bin/env -S sh -c 'NIX_SHEBANG_DEVSHELL_MERGE+=",$(pwd)/flake_a#default|$(pwd)/flake_b#cowsay" "$(dirname "$0")"/tools/nix-trampoline" "$(dirname "$0")/flake_dir" "" "bash" "$0" "$@"''
+#   Flake directory, default devShell:
+#     #!/usr/bin/env -S sh -c '"$(dirname "$0")"/tools/nix-shebang-trampoline" "$(dirname "$0")/flake_dir" "" python3 "$0" "$@"'
+#   Flake directory, named devShell:
+#     #!/usr/bin/env -S sh -c '"$(dirname "$0")"/tools/nix-shebang-trampoline" "$(dirname "$0")/flake_dir" "myRubyShell" ruby "$0" "$@"'
+#   Classic shell.nix, no attribute:
+#     #!/usr/bin/env -S sh -c '"$(dirname "$0")"/tools/nix-shebang-trampoline" "$(dirname "$0")/shell.nix" "" python3 "$0" "$@"'
+#   Named attribute in another *.nix file:
+#     #!/usr/bin/env -S sh -c '"$(dirname "$0")"/tools/nix-shebang-trampoline" "$(dirname "$0")/dev.nix" "cowsay" cowsay "$0" "$@"'
+#   A flake directory and a shell.nix declared independent:
+#     #!/usr/bin/env -S sh -c 'NIX_SHEBANG_DEVSHELL_MERGE+=",$(pwd)/flake_dir|$(pwd)/shell.nix" "$(dirname "$0")"/tools/nix-shebang-trampoline" "$(dirname "$0")/shell.nix" "" bash "$0" "$@"'
 
 
 SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
@@ -199,38 +162,55 @@ normalize_devshell_id() {
 # Environment
 #-------------------------------
 
-if [ -z "$NIX_FLAKE_ENTER_WRAPPER" ]; then
-    NIX_FLAKE_ENTER_WRAPPER="${SCRIPT_DIR}/nix-flake-enter"
+if [ -z "$NIX_DEVSHELL_ENTER_WRAPPER" ]; then
+    NIX_DEVSHELL_ENTER_WRAPPER="${SCRIPT_DIR}/nix-devshell-enter"
 fi
 
-[ -f "$NIX_FLAKE_ENTER_WRAPPER" ] || die "No such nix-flake-enter: ${NIX_FLAKE_ENTER_WRAPPER}"
-[ -x "$NIX_FLAKE_ENTER_WRAPPER" ] || die "Not executable nix-flake-enter: ${NIX_FLAKE_ENTER_WRAPPER}"
+[ -f "$NIX_DEVSHELL_ENTER_WRAPPER" ] || die "No such nix-devshell-enter: ${NIX_DEVSHELL_ENTER_WRAPPER}"
+[ -x "$NIX_DEVSHELL_ENTER_WRAPPER" ] || die "Not executable nix-devshell-enter: ${NIX_DEVSHELL_ENTER_WRAPPER}"
 
 #-------------------------------
 # Args
 #-------------------------------
 
 # There must be at least an interpreter and a script path, otherwise we aren't using the shebang
-[ $# -ge 4 ] || die "Too few arguments. USAGE: $0 <flake_dir> <devShell_name> <interpreter> <script_path> [<script_args>...]"
+[ $# -ge 4 ] || die "Too few arguments. USAGE: $0 <flake_dir_or_nix_file> <devShell_or_attr> <interpreter> <script_path> [<script_args>...]"
 
-_flake_dir_arg="$1"
+_target_arg="$1"
 _devshell_arg="$2"
 shift 2
 # The rest are the interpreter, the script path, and any script arguments.
 
-[ -d "$_flake_dir_arg" ] || die "Flake directory doesn't exist: ${_flake_dir_arg}"
-[ -f "${_flake_dir_arg}/flake.nix" ] || die "No 'flake.nix' in flake directory: ${_flake_dir_arg}"
-# convert to absolute path w/o symlink resolution, and drop a trailing slash so
-# /path/flake and /path/flake/ are the same flake. "/" itself is left as "/".
-_flake_dir_arg=$(cd "$_flake_dir_arg" && pwd)
-_flake_dir_arg=$(normalize_flake_path "$_flake_dir_arg")
+# A trailing slash does not change the kind of path. "/" itself stays "/".
+_target_stripped=$(printf '%s\n' "$_target_arg" | sed -E -e 's@/+$@@')
+[ -n "$_target_stripped" ] || _target_stripped=/
 
-# We only care about a consistent name for our stack. 
-# We can assume the nix "system" type is always the same, so no need to track it too, even though it's technically part of the devShell spec.
+_stack_path=
+case "$_target_stripped" in
+    *.nix)
+        [ -f "$_target_stripped" ] || die "Invalid .nix file: ${_target_stripped}"
+        _stack_parent=$(CDPATH= cd "$(dirname "$_target_stripped")" && pwd) || die "Invalid .nix file: ${_target_stripped}"
+        _stack_parent=$(normalize_flake_path "$_stack_parent")
+        if [ "$_stack_parent" = / ]; then
+            _stack_path="/$(basename "$_target_stripped")"
+        else
+            _stack_path="${_stack_parent}/$(basename "$_target_stripped")"
+        fi
+        ;;
+    *)
+        [ -d "$_target_stripped" ] || die "Flake directory doesn't exist: ${_target_stripped}"
+        [ -f "${_target_stripped}/flake.nix" ] || die "No 'flake.nix' in flake directory: ${_target_stripped}. Pass the .nix file explicitly."
+        _stack_path=$(CDPATH= cd "$_target_stripped" && pwd)
+        _stack_path=$(normalize_flake_path "$_stack_path")
+        ;;
+esac
+
+# Blank is stored as #default for both flakes and classic files. For a classic file that
+# placeholder is not an attribute named default.
 if [ -z "$_devshell_arg" ]; then
-    _nix_flake_devshell="${_flake_dir_arg}#default"
+    _nix_flake_devshell="${_stack_path}#default"
 else
-    _nix_flake_devshell="${_flake_dir_arg}#${_devshell_arg}"
+    _nix_flake_devshell="${_stack_path}#${_devshell_arg}"
 fi
 
 #-------------------------------
@@ -431,7 +411,8 @@ if need_devshell_enter "$_nix_flake_devshell"; then
     push_stack "$_nix_flake_devshell"
 
     # Enter the devShell and run the command in it
-    exec "$NIX_FLAKE_ENTER_WRAPPER" "$_flake_dir_arg" "$_devshell_arg" "$@"
+    # Pass the caller's path, not the absolute stack id. A trailing slash was already removed.
+    exec "$NIX_DEVSHELL_ENTER_WRAPPER" "$_target_stripped" "$_devshell_arg" "$@"
     
     pop_stack    
 else
