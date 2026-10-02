@@ -288,7 +288,7 @@ functional() {
         while true; do
             if find "$cache" -path '*/x/*/x/*' -print -quit 2>/dev/null | grep -q .; then
                 echo exploded > "$WORK/exploded"
-                pkill -f "$cache/nix-store/.nix-portable" || true
+                kill_matching "$cache/nix-store/.nix-portable" "$$"
                 exit 0
             fi
             sleep 2

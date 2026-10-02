@@ -389,7 +389,10 @@ bootstrap_env() {
     reset_env
     new_work
     tool_dir=$WORK/tools
-    link_tools "$tool_dir" $BASE_TOOLS wget
+    link_tools "$tool_dir" $BASE_TOOLS
+    # Self-test only checks that a command named wget is on PATH. It never runs it.
+    printf '%s\n' '#!/bin/sh' 'exit 0' > "$tool_dir/wget"
+    chmod a+x "$tool_dir/wget"
     export BYO_SELF_TEST=1
     export BYO_NIX_PORTABLE_CACHE_ROOT=$WORK/root
     PATH=$tool_dir

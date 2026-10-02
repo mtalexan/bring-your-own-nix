@@ -72,6 +72,9 @@
 #     store are being transferred with the associated flake.lock and supplied from a read-only location
 #     that doesn't allow locking. Or (not recommended even still) if you can absolutely guarantee that
 #     only a single process on the system will ever possibly be trying to modify the store.
+#   NSCD_SOCKET=/var/run/nscd/socket
+#     Path this script checks before entering a devShell. glibc itself always uses
+#     /var/run/nscd/socket. Set this only to exercise the missing-socket error.
 # 
 # Examples:
 #   Each of these requires a properly configured flake.nix that defines the environment(s).
@@ -87,8 +90,10 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${0}")" && pwd)"
 
-# The glibc hardcoded location, this cannot be changed.
-NSCD_SOCKET="/var/run/nscd/socket"
+# glibc always consults /var/run/nscd/socket. The variable only changes this script's check.
+if [ -z "$NSCD_SOCKET" ]; then
+    NSCD_SOCKET="/var/run/nscd/socket"
+fi
 
 die() {
     [ $# -eq 0 ] || echo >&2 "ERROR:" "$@"
@@ -162,8 +167,11 @@ shift 2
 
 [ -d "$_flake_dir" ] || die "Flake directory doesn't exist: ${_flake_dir}"
 [ -f "${_flake_dir}/flake.nix" ] || die "No 'flake.nix' in flake directory: ${_flake_dir}"
-# convert to absolue path w/o symlink resolution
+# convert to absolute path w/o symlink resolution, and drop a trailing slash so
+# /path/flake and /path/flake/ are the same flake. "/" itself is left as "/".
 _flake_dir=$(cd "$_flake_dir" && pwd)
+_flake_dir=$(printf '%s\n' "$_flake_dir" | sed -E -e 's@/+$@@')
+[ -n "$_flake_dir" ] || _flake_dir=/
 
 # Get the object within the flake.nix for the specific devShell. Only support the modern 
 # 'devShells.*.default' and not the deprecated 'devShell' for the default.
