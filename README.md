@@ -12,7 +12,7 @@ Bootstrap a workspace/project-local nix instance on-demand, including from a scr
 
 - You still need `bash` natively installed in your host environment, this is unavoidable
 - You enter an overlay environment, there is no file system isolation, network isolation, etc like with containers
-- You need to define a `flake.nix` that includes a `devShell` with all the tools you need for the overlay environment
+- You need to define a `flake.nix` that includes a `devShell`, or a classic `*.nix` file that evaluates to a `pkgs.mkShell`, with all the tools you need for the overlay environment
 - The first time running a script in a workspace can take longer while it downloads and installs packages (in a workspace store) for your overlay environment
 
 ## Background
@@ -59,8 +59,8 @@ Configuration of the tool makes use of environment variables:
 - `BYO_NIX_PORTABLE_DL_CMD` is for when you have non-trivial download requirements for the `BYO_NIX_PORTABLE_URL`. The default is to look for `curl` or `wget` and do a regular download of the URL using the default system settings. If you need to authenticate to a caching server or something more complicated, you can put that into your own script and point to that script with this variable. The script is always passed the `BYO_NIX_PORTABLE_URL` as the first argument, and the absolute path and name of the file it should be downloaded to as the second argument. 
 - `BYO_FORCE_DOWNLOAD` can be set (to anything non-blank) if you want to force a download of `nix-portable` to occur. Instead of looking to see if it already exists, the download will always occur and may overwrite an existing file.
 - `BYO_NO_LOCK` skips all locking or lockfile creation. This should only be used if an existing `nix-portable` and store associated with a `flake.lock` are all being deployed together via a read-only folder. Creation or updates to the `nix-portable` and store are required to be managed via write locks to ensure parallel calls to `byo-nix` don't simultaneously try to create/modify them.
-- `BYO_NIX` can be set to point to a system install of `nix`, allowing existing tooling designed primarily for use with `nix-portable` to be used as-is on top of a system-installed `nix` instead. The `byo-nix` script effectively turns into just an `exec "$BYO_NIX" "$@"` call when this is set. The system install must have flakes and the `nix` command enabled so it accepts the same arguments as `nix-portable`.
-- `BYO_NIX_PORTABLE_STORE_LOCKED` is for a caller that already holds the `BYO_NIX_PORTABLE_STORE` write lock when it calls `byo-nix`. The first-use check described below then runs without taking that lock again, which would otherwise wait forever. `nix-flake-enter` sets it for the calls it makes while holding the lock. It is not passed on to `nix-portable`.
+- `BYO_NIX` can be set to point to a system install of `nix`, allowing existing tooling designed primarily for use with `nix-portable` to be used as-is on top of a system-installed `nix` instead. The `byo-nix` script effectively turns into just an `exec "$BYO_NIX" "$@"` call when this is set. That Nix must have the `nix-command` experimental feature enabled, because these tools use the `nix` CLI (`nix build`, `nix develop`). The `flakes` feature is required only when a directory is used as a flake. A user who only ever passes `*.nix` files can use a Nix install that does not have `flakes` enabled. nix-portable enables both by default, so this only matters for a native install.
+- `BYO_NIX_PORTABLE_STORE_LOCKED` is for a caller that already holds the `BYO_NIX_PORTABLE_STORE` write lock when it calls `byo-nix`. The first-use check described below then runs without taking that lock again, which would otherwise wait forever. `nix-devshell-enter` sets it for the calls it makes while holding the lock. It is not passed on to `nix-portable`.
 - `BYO_ONLY_GET` can be set (to anything non-blank) to stop once `nix-portable` is present and executable. The store lockfile is not created and `nix` is not invoked. This can be combined with `BYO_FORCE_DOWNLOAD` to refresh a cached binary. It is ignored when `BYO_NIX` is set.
 - `BYO_SELF_TEST` can be set (to anything non-blank) to skip downloads, lockfile creation, and the `nix` invocation. The script checks what it would do, prints that to stderr, and exits with an error. When `BYO_NIX` is set it checks that the given binary exists and is executable.
 
@@ -68,7 +68,7 @@ Configuration of the tool makes use of environment variables:
 This script is intended for one-off manual operations on a store that doesn't have any other activity going on, or for more advanced tools to use.  
 It is safe to perform any number of read operations of existing content from a store without needing to lock. It's even safe to perform writes to the store at the same time reads of preexisting content are happening, since the content hash addressing ensures the store objects being read and written won't conflict. It is not safe, however, to perform multiple actions that write, or actions that might read content that's still being written. A write lock for the store is created by this tool for the purposes of locking the store during writes, but the tool is not capable of detecting every case where a write to the store might occur.
 
-**Note:** `byo-nix` does not set nix-portable's `NP_GIT`, and it clears an inherited value before invoking nix-portable. Nix needs a `git` for flakes. Pointing `NP_GIT` at a host `git` would avoid installing another copy, but nix-portable implements that by deleting and recreating `$NP_LOCATION/.nix-portable/tmpbin` on every start and then creating `tmpbin/git` with `ln -s`. That directory is shared by every process using the store. Overlapping nix-portable invocations race on it and fail with `File exists`. These tools do overlap: `nix-flake-enter` holds the store lock only around the devShell pre-build and releases it before `nix develop`, and a shebang script can be running in one devShell while another command uses the same store. No lock can cover that startup step for every invocation, since commands in a devShell run outside the lock. Leaving `NP_GIT` unset makes nix-portable install its own `gitMinimal` into the portable store once, on first use, and later invocations of that same store reuse it.
+**Note:** `byo-nix` does not set nix-portable's `NP_GIT`, and it clears an inherited value before invoking nix-portable. Nix needs a `git` for flakes. Pointing `NP_GIT` at a host `git` would avoid installing another copy, but nix-portable implements that by deleting and recreating `$NP_LOCATION/.nix-portable/tmpbin` on every start and then creating `tmpbin/git` with `ln -s`. That directory is shared by every process using the store. Overlapping nix-portable invocations race on it and fail with `File exists`. These tools do overlap: `nix-devshell-enter` holds the store lock only around the devShell pre-build and releases it before `nix develop`, and a shebang script can be running in one devShell while another command uses the same store. No lock can cover that startup step for every invocation, since commands in a devShell run outside the lock. Leaving `NP_GIT` unset makes nix-portable install its own `gitMinimal` into the portable store once, on first use, and later invocations of that same store reuse it.
 
 When `byo-nix` is already running inside that store's nix-portable sandbox, it executes the `nix` binary from the store instead of starting nix-portable again. A second nix-portable would nest proot or bubblewrap. Nested proot cannot set `PTRACE_O_TRACESECCOMP`, and then either cannot find the nix binary or fails with `Operation not permitted` while reading store paths. Entering another devShell from a shebang that is already inside one is that case. `byo-nix` records the store path in `__BYO_NIX_INSIDE_STORE` when it starts nix-portable, and a later call for that same store uses the store `nix` directly. The store `nix` is only used when `/nix/store` is this portable store, so a system nix store is left alone.
 
@@ -104,103 +104,124 @@ byo-nix build '.'
 byo-nix flake update '.'
 ```
 
-### `nix-flake-enter`
+### `nix-devshell-enter`
 
-Designed for entering a `devShell` of a nix flake using `byo-nix` by calling `nix develop` on it.  This wrapper pre-checks if the devShell environment is already fully built and in the store, and will grab the store write lock and pre-build it if not. 
+Enters a Nix devShell using `byo-nix`. A directory is a flake, and `nix develop` is called on it. A classic environment is an explicit `*.nix` file, and `nix develop -f` is called on that file. `shell.nix` is the conventional name for that file. There is no fallback from a directory to a file, and no fallback from one filename to another. This wrapper pre-checks if the devShell environment is already fully built and in the store, and will grab the store write lock and pre-build it if not.
 
 **WARNING:** The `nscd` or `nsncd` daemon is REQUIRED to be present and running on your system!  
-With nix, all packages are fully deterministic, which includes its own copy of glibc. That glibc is pretty much guaranteed to differ from the one present on the host system, either in version, toolchain used to build it, or configuration. For a number of system commands/tools, however, the `nsswitch.conf` specifies plugin libraries that should be loaded to extend the normal logic. This includes things like user name lookups for example, and they are not optional on a Linux system. These plugin libraries get dynamically loaded into the glibc, which means they have to exactly match the version, toolchain, etc of the glibc they're used with. This mismatch issue was foreseen, however, and glibc includes hardcoded support for an `nscd` daemon. The `nscd` daemon accepts glibc requests on a hardcoded socket, and will run those requests using the native glibc and any plugin libraries. This allows a different glibc to effectively front for a host glibc with plugin modules. The original `nscd` daemon supports a number of additional features as well, and presents somewhat of a security risk in system design. Some distros, like Fedora, have chosen to stop including it despite having no alternative solution for this necessary use case. The `nsncd` daemon is a Rust-based rewrite of the minimal glibc functionality from the original `nscd` and is available as a single stand-alone binary. For systems that don't have `nscd` available thru their native package managers anymore, `nsncd` is the preferred alternative. Only one of the two can be present on a system, since they both open the specific hardcoded socket name compiled into all versions of glibc, but one of them is explicitly required by this tool since flake devShells can very rarely function properly without it.
-
+With nix, all packages are fully deterministic, which includes its own copy of glibc. That glibc is pretty much guaranteed to differ from the one present on the host system, either in version, toolchain used to build it, or configuration. For a number of system commands/tools, however, the `nsswitch.conf` specifies plugin libraries that should be loaded to extend the normal logic. This includes things like user name lookups for example, and they are not optional on a Linux system. These plugin libraries get dynamically loaded into the glibc, which means they have to exactly match the version, toolchain, etc of the glibc they're used with. This mismatch issue was foreseen, however, and glibc includes hardcoded support for an `nscd` daemon. The `nscd` daemon accepts glibc requests on a hardcoded socket, and will run those requests using the native glibc and any plugin libraries. This allows a different glibc to effectively front for a host glibc with plugin modules. The original `nscd` daemon supports a number of additional features as well, and presents somewhat of a security risk in system design. Some distros, like Fedora, have chosen to stop including it despite having no alternative solution for this necessary use case. The `nsncd` daemon is a Rust-based rewrite of the minimal glibc functionality from the original `nscd` and is available as a single stand-alone binary. For systems that don't have `nscd` available thru their native package managers anymore, `nsncd` is the preferred alternative. Only one of the two can be present on a system, since they both open the specific hardcoded socket name compiled into all versions of glibc, but one of them is explicitly required by this tool since devShells can very rarely function properly without it.
 
 The arguments to this script are:
-1. The path to the folder containing the `flake.nix` describing your devShell(s).
-2. The name of the devShell in the flake to enter. If this is blank it is assumed to be the default devShell.
+1. A flake directory, or a classic `*.nix` file. A path whose name ends in `.nix` is always a classic file and must be a regular file. Any other path must be a directory containing `flake.nix`. A directory that only has `shell.nix`, `default.nix`, or another `*.nix` file is an error that tells you to pass that file. A directory whose name ends in `.nix` is rejected. A classic file, or the selected attribute, must evaluate to a `pkgs.mkShell`. A package expression, such as a typical `default.nix` built with `mkDerivation`, is not supported.
+2. A flake devShell name, or a classic attribute path. Blank selects the flake default devShell, or the classic file's own derivation. Blank is recorded as `default` on the shebang stack for both. For a classic file that `default` is only the stack placeholder: it is not passed to `nix develop`.
 3. The command to run in the devShell.
 4. (and all additional arguments) Optionally, any additional arguments to pass to the command being run within the devShell.
 
-A blank devShell name selects `devShells.<system>.default`. The `<system>` value is detected from the host and will be one of `x86_64-linux`, `aarch64-linux`, `armv7l-linux`, or `i686-linux`. Only that `devShells.<system>.<name>` output is recognized.
+A blank flake devShell name selects `devShells.<system>.default`. The `<system>` value is detected from the host and will be one of `x86_64-linux`, `aarch64-linux`, `armv7l-linux`, or `i686-linux`. Only that `devShells.<system>.<name>` output is recognized. A classic attribute is whatever the file returns; it is not a `devShells.<system>.<name>` output.
+
+**WARNING:** nix-portable ships a nixpkgs channel pinned when that nix-portable was built, which can be as much as two years old. An unpinned nixpkgs in a classic `*.nix` file uses that channel. niv and npins can pin a newer nixpkgs for the rest of the derivation, but the niv or npins tool itself still comes from that channel.
+
+**WARNING:** The classic pre-build only asks Nix whether that `inputDerivation` is already in the store (`nix build --dry-run`). It does not watch the `.nix` file or a pin lock for edits. If the evaluated inputs are unchanged, including when an niv or npins lock was not updated, the existing store object is reused and nothing is rebuilt.
 
 The store write lock is held across the dry-run and any pre-build, and `BYO_NIX_PORTABLE_STORE_LOCKED` is set for those two `byo-nix` calls. `byo-nix` therefore runs any `nix-portable` first-use setup under that same lock.
 
 - All `byo-nix` environment variables are passed thru to the underlying `byo-nix`.  A few of the variables have additional effects in this script too:
   - `BYO_NO_LOCK` if set, the pre-check and possible pre-build of the devShell is skipped because it's unnecessary if no explicit locking is going to occur. It will rely on the `nix develop` call to do any store updates, which will occur unsafely and unlocked if they are needed.
-  - `BYO_NIX` if set, the pre-check and possible pre-build of the devShell is skipped since system nix safely manages it during the `nix develop` call already.
+  - `BYO_NIX` if set, the pre-check and possible pre-build of the devShell is skipped since system nix safely manages it during the `nix develop` call already. A native Nix install must have `nix-command` enabled. `flakes` is required only for a flake directory.
 - `BYO_NIX_WRAPPER` if your `byo-nix` script isn't in the same folder as this script, you will need to specify the path to it in this variable.
 
-#### `nix-flake-enter` Use Cases
+#### `nix-devshell-enter` Use Cases
 
-_Use `nix-flake-enter` when a command should run inside a flake devShell, including when that devShell may still need to be built into the store._
+_Use `nix-devshell-enter` when a command should run inside a flake devShell or a classic `pkgs.mkShell`, including when that devShell may still need to be built into the store._
 
-A blank devShell name still has to be passed, as `""`, so the command stays in argument 3.
+A blank devShell name or attribute still has to be passed, as `""`, so the command stays in argument 3.
 
 - Running a command in the default devShell of the flake in the current directory.
 
 ```shell
-nix-flake-enter . "" python3 ./myscript.py arg1
+nix-devshell-enter . "" python3 ./myscript.py arg1
 ```
 
 - Running a command in a named devShell.
 
 ```shell
-nix-flake-enter ./flake_dir myRubyShell ruby ./script.rb
+nix-devshell-enter ./flake_dir myRubyShell ruby ./script.rb
+```
+
+- Running a command in a classic `shell.nix`, with no attribute.
+
+```shell
+nix-devshell-enter ./shell.nix "" python3 ./myscript.py arg1
+```
+
+- Running a command in a named attribute of another `*.nix` file.
+
+```shell
+nix-devshell-enter ./dev.nix cowsay cowsay hello
 ```
 
 - Opening an interactive shell in the default devShell. Pass the shell as the command.
 
 ```shell
-nix-flake-enter . "" bash
+nix-devshell-enter . "" bash
 ```
 
 - Running a container tool from a named devShell that provides it.
 
 ```shell
-nix-flake-enter . isolatedPodmanShell podman info
+nix-devshell-enter . isolatedPodmanShell podman info
 ```
 
 ### `nix-bang`
 
-For use in the shebang of scripts, this wraps `nix-flake-enter` and manages whether or not the requested flake devShell is already part of the current environment.
+For use in the shebang of scripts, this wraps `nix-devshell-enter` and manages whether or not the requested devShell is already part of the current environment.
 
 **WARNING:** Some environments only keep the first 127 characters of a shebang line. proot is one of them, and nix-portable uses proot when bubblewrap is not available. A longer `env -S` line is cut off inside the quotes, and `env` exits 125 with `no terminating quote in -S string`. The kernel and bubblewrap allow a longer line, so the failure appears when another shebang script is started from inside that proot.
 
 Unfortunately the syntax of shebangs is limited and there's no way to reference a path relative to the calling directory or script the shebang is in for picking the interpreter. The solution is that a `sh`, `bash` or similar interpreter be specified in the shebang, but with arguments that direct it to run this script from its relative path using a specific interpreter.  Shebang lines are entirely ignored if an interpreter is explicitly specified, so this avoids this script accidentally calling itself recursively.
 
 The arguments to this script are:
-1. The path to the folder containing the `flake.nix` describing your devShell(s). A relative path is converted to an absolute path without resolving symlinks. Flake identity is a text match on that absolute path, so the same flake reached through a different symlink is a different flake for the purposes of detecting if it has been entered yet.
-2. The name of the devShell in the flake to enter. If this is blank it is assumed to be the default devShell (`devShells.<system>.default`). Only that `devShells.<system>.<name>` output is recognized, with `<system>` detected the same way as in `nix-flake-enter`.
+1. A flake directory, or a classic `*.nix` file. A directory is a flake and must contain `flake.nix`. A classic environment is an explicit `*.nix` file, with no fallback from a directory or from one filename to another. `shell.nix` is the conventional name. A path whose name ends in `.nix` is always that file. A relative path is converted to an absolute path without resolving symlinks. The same project reached through a different symlink is a different devShell.
+2. A flake devShell name, or a classic attribute path. Blank becomes `default` in `__NIX_SHEBANG_STACK` for both. For a flake, blank is `devShells.<system>.default`. For a classic file, `default` is only that placeholder and means the file's own derivation. A classic file, or the selected attribute, must evaluate to a `pkgs.mkShell`. A package expression, such as a typical `default.nix` built with `mkDerivation`, is not supported.
 3. The interpreter to run once the devShell is the current environment. For example `python3`, `ruby`, `bash`, etc.
 4. The first argument to that interpreter. In a shebang this is always `"$0"`, the script being executed.
 5. (and all additional arguments) Arguments for the interpreter. In a shebang this is always `"$@"`.
 
-When using a script like this in the shebang of a tool, it's likely that it might call another tool that also uses this in its shebang. When both those tools are within the same project, there's a very good chance the devShell being requested in both tools is the same one. However it may have called a tool that needs a different devShell instead, and that tool may then call a tool that needs the first devShell back. This leads to an effective stack of nested devShells that need to be tracked to determine if a newly requested devShell is already part of the one we're in or not, and for simply acting as a passthru for the original command when we're already in the correct devShell.
+**WARNING:** nix-portable ships a nixpkgs channel pinned when that nix-portable was built, which can be as much as two years old. An unpinned nixpkgs in a classic `*.nix` file uses that channel. niv and npins can pin a newer nixpkgs for the rest of the derivation, but the niv or npins tool itself still comes from that channel.
 
-You may call other scripts that use this special shebang from within scripts that also use it, even if they need different flakes and/or devShells. The overhead for entering the devShell is skipped if it's not needed. \
-The flake-specific devShells you've already entered are tracked as a call stack in a reserved `__NIX_SHEBANG_STACK` environment variable. Each stack entry is `${flake_abs_path}#${devShell}`, where `${flake_abs_path}` is the absolute path of the directory containing `flake.nix`, not the path to the `flake.nix` file itself. The devShell name is the same as in `NIX_SHEBANG_DEVSHELL_MERGE`: the output name only, without the `devShells.<system>.` prefix, and `default` for the default devShell. The flake's absolute path must not have symlinks resolved, so the same flake reached through a different symlink does not match. A trailing `/` on the flake directory is ignored. \
-There are 3 possibilities for what needs to happen, with the `NIX_SHEBANG_DEVSHELL_MERGE` environment variable controlling how one of the possibilities is handled:
-1. The flake+devShell is not in the stack: build and enter it.
-2. The flake+devShell is already at the top of the stack: we don't need to re-enter.
-3. The flake+devShell is present in the stack, but not at the top of the stack:
-   1. If `NIX_SHEBANG_DEVSHELL_MERGE` indicates the flake+devShells between the top and the one we need are "mergeable", we don't need to re-enter.
-   2. Otherwise, we re-enter.
+**WARNING:** The classic pre-build only asks Nix whether that `inputDerivation` is already in the store. It does not watch the `.nix` file or a pin lock for edits. If the evaluated inputs are unchanged, including when an niv or npins lock was not updated, the existing store object is reused and nothing is rebuilt.
 
-`NIX_SHEBANG_DEVSHELL_MERGE` is a comma-separated list of pipe-separated flake+devShells. Each entry is either `${flake_abs_path}#${devShell}` or, as shorthand, only `${flake_abs_path}`. `${flake_abs_path}` is the absolute path of the directory containing `flake.nix` (for example `/home/me/project/flake_dir#default`, not `/home/me/project/flake_dir/flake.nix#default`). The default devShell is simplified to just `default`. A bare directory means every devShell in that flake is independent of the other entries in that pipe-separated set. Naming one devShell, such as `flake_dir#default`, does not cover the other devShells in that flake. The flake's absolute path must not have symlinks resolved. A trailing `/` on that directory is ignored, so `/home/me/project/flake_dir` and `/home/me/project/flake_dir/` are the same flake. Empty comma-separated values are silently ignored, including leading and trailing ones, to make the list easier to generate programmatically. \
-Each comma-separated set of pipe-separated flake+devShells is a declaration that those flake+devShells can be entered in any order and will always produce the same effective resulting devShell. In other words, each of them only makes non-overlapping changes. \
-The benefit of specifying this when known is that it can significantly reduce the overhead of flake+devShell re-entry when using scripts with shebangs that call each other back and forth between different flakes and/or devShells. A simple example is if `scriptA` and `scriptC` need `${PWD}#devShell1` and `scriptB` needs `${PWD}#devShell2`. If `scriptA` calls `scriptB` which calls `scriptC` you can eliminate re-entering `${PWD}#devShell1` when executing `scriptC` because you already entered it for `scriptA` and overlaying `${PWD}#devShell2` for `scriptB` doesn't conflict with it.
+Scripts that use this trampoline often call each other. Re-entering a devShell that is already active is slow, so the trampoline tracks the devShells it has entered. When another devShell has been entered since then, it cannot tell whether that one changed something the earlier one set, so by default it enters again.
 
+`NIX_SHEBANG_DEVSHELL_MERGE` lists devShells that are independent of each other. Within one set they are treated as non-conflicting, so an earlier one still counts as active when only members of that set have been entered after it.
+
+- Comma-separated sets. Each set is a pipe-separated list of entries. Blank comma entries are ignored, so `NIX_SHEBANG_DEVSHELL_MERGE="${NIX_SHEBANG_DEVSHELL_MERGE},..."` is always safe. Blank pipe entries are an error. Sets are not combined with each other.
+- Paths are absolute and must match the path given to the trampoline, without resolving symlinks. A trailing `/` is ignored.
+- Flake: the directory containing `flake.nix`. `/proj` means every devShell in that flake. `/proj#name` means only that devShell, and `/proj#default` is the default devShell.
+- Classic: the full path to the `.nix` file. `/proj/shell.nix` means every attribute of that file, including the file's own derivation when no attribute is given. `/proj/shell.nix#name` means only that attribute, and `/proj/shell.nix#default` is the file's derivation when no attribute was passed.
+- `/proj` and `/proj/shell.nix` are different entries. A flake directory never covers a classic file in it.
+
+A flake directory whose name ends in `.nix` is not supported. Any path ending in `.nix` is treated as a classic file, so such a directory fails as an invalid `.nix` file.
+
+One set can mix a flake directory and a `shell.nix`:
+
+```shell
+NIX_SHEBANG_DEVSHELL_MERGE="${NIX_SHEBANG_DEVSHELL_MERGE},/proj|/proj/shell.nix"
+```
 
 Environment variables:
-- All `byo-nix` and `nix-flake-enter` environment variables are passed thru when a devShell is entered. `BYO_NO_LOCK` and `BYO_NIX` still skip the pre-build inside `nix-flake-enter`. When the requested devShell is already in effect, none of that runs, and the interpreter is executed in the current environment.
-- `NIX_FLAKE_ENTER_WRAPPER` is the path to `nix-flake-enter`. If this script and `nix-flake-enter` are not in the same folder, set it. The default is `nix-flake-enter` next to this script.
+- All `byo-nix` and `nix-devshell-enter` environment variables are passed thru when a devShell is entered. `BYO_NO_LOCK` and `BYO_NIX` still skip the pre-build inside `nix-devshell-enter`. When the requested devShell is already in effect, none of that runs, and the interpreter is executed in the current environment.
+- `NIX_DEVSHELL_ENTER_WRAPPER` is the path to `nix-devshell-enter`. If this script and `nix-devshell-enter` are not in the same folder, set it. The default is `nix-devshell-enter` next to this script.
 - `NIX_SHEBANG_DEVSHELL_MERGE` is the comma-separated list of mergeable sets described above.
-- `__NIX_SHEBANG_STACK` is reserved for the devShell stack. Leave it unset in the environment you start from.
+- `__NIX_SHEBANG_STACK` is reserved. Leave it unset in the environment you start from.
 
 #### `nix-bang` Use Cases
 
-_Put `nix-bang` in the shebang of a script whose interpreter lives in a flake devShell, including when that script may call another script that wants the same devShell or a different one._
+_Put `nix-bang` in the shebang of a script whose interpreter lives in a flake devShell or a classic `pkgs.mkShell`, including when that script may call another script that wants the same devShell or a different one._
 
-Compute the script directory once, then use paths relative to it for both `nix-bang` and the flake. This keeps the line short without changing the script's working directory. These examples assume the three utilities live in a `tools/` directory next to the script, and the flake is in `flake_dir` next to the script. Merge paths are absolute and do not resolve symlinks, so the text matches the path given to `nix-bang`.
+Compute the script directory once, then use paths relative to it for both `nix-bang` and the flake or classic file. This keeps the line short without changing the script's working directory. These examples assume the three utilities live in a `tools/` directory next to the script. Merge paths are absolute and do not resolve symlinks, so the text matches the path given to `nix-bang`.
 
-- As the shebang of a Python script, using the default devShell.
+- As the shebang of a Python script, using the default devShell of a flake directory.
 
 ```shell
 #!/usr/bin/env -S sh -c 'd=$(dirname "$0");"$d"/tools/nix-bang "$d"/flake_dir "" python3 "$0" "$@"'
@@ -212,18 +233,30 @@ Compute the script directory once, then use paths relative to it for both `nix-b
 #!/usr/bin/env -S sh -c 'd=$(dirname "$0");"$d"/tools/nix-bang "$d"/flake_dir rubyDev ruby "$0" "$@"'
 ```
 
+- As the shebang of a Python script, using a `shell.nix` with no attribute.
+
+```shell
+#!/usr/bin/env -S sh -c 'd=$(dirname "$0");"$d"/tools/nix-bang "$d"/shell.nix "" python3 "$0" "$@"'
+```
+
+- As the shebang of a script, using a named attribute in another `*.nix` file.
+
+```shell
+#!/usr/bin/env -S sh -c 'd=$(dirname "$0");"$d"/tools/nix-bang "$d"/dev.nix cowsay cowsay "$0" "$@"'
+```
+
 - As a direct call, using the flake in the current directory to run a command in a named devShell. The interpreter and its first argument are still required.
 
 ```shell
 ./tools/nix-bang . "isolatedPodmanShell" podman info
 ```
 
-- When flakes are independent, set `NIX_SHEBANG_DEVSHELL_MERGE` in the environment, then use the regular shebang. A bare directory covers every devShell in that flake. Paths are absolute and do not resolve symlinks.
+- When a flake directory and a `shell.nix` are independent, set `NIX_SHEBANG_DEVSHELL_MERGE` in the environment, then use the regular shebang. A bare directory covers every devShell in that flake. A bare `*.nix` path covers every attribute of that file. Paths are absolute and do not resolve symlinks.
 
 ```shell
-export NIX_SHEBANG_DEVSHELL_MERGE="/proj/flake_dir|/proj/flake_dirA|/proj/flake_dirB"
+export NIX_SHEBANG_DEVSHELL_MERGE="/proj/flake_dir|/proj/shell.nix"
 ```
 
 ```shell
-#!/usr/bin/env -S sh -c 'd=$(dirname "$0");"$d"/tools/nix-bang "$d"/flake_dir "" bash "$0" "$@"'
+#!/usr/bin/env -S sh -c 'd=$(dirname "$0");"$d"/tools/nix-bang "$d"/shell.nix "" bash "$0" "$@"'
 ```
